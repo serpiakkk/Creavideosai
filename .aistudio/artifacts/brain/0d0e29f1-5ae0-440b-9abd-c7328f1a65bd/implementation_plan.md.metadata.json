@@ -1,0 +1,6 @@
+{
+  "summary": "Plan de implementacion para AutoVideo IA: PWA instalable con generacion de video por escenas a partir de guion mediante Gemini API (Gemini 3.8 Flash, Gemini 3.1 Flash Lite Image, Gemini 3.8 Flash Lite TTS), renderizador en Canvas y Web Audio con Ken Burns, subtitulos dinamicos, ducking de audio, persistencia en IndexedDB y cola tolerante a limites de cuota.",
+  "updatedAt": "2026-10-19T02:48:02.500013486Z",
+  "requestFeedback": true,
+  "userFacing": true
+}

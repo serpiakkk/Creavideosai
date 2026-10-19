@@ -1,0 +1,6 @@
+{
+  "name": "AutoVideo IA",
+  "description": "Convierte guiones en videos completos con imagenes IA, narracion por voz de Gemini, subtitulos dinamicos y exportacion de video.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
