@@ -1,15 +1,18 @@
 import React, { useEffect, useState } from 'react';
 import { VideoProject } from './types';
 import { getAllProjects, saveProject, deleteProjectById, getProjectById } from './services/db';
+import { ChatView } from './views/ChatView';
 import { HomeView } from './views/HomeView';
 import { NewProjectView } from './views/NewProjectView';
 import { GeneratingView } from './views/GeneratingView';
 import { EditorView } from './views/EditorView';
 import { PreviewExportView } from './views/PreviewExportView';
 import { WifiOff } from 'lucide-react';
+import { ToastProvider } from './components/Toast';
+import { PWAUpdatePrompt } from './components/pwa/PWAUpdatePrompt';
 
 export default function App() {
-  const [currentView, setCurrentView] = useState<'home' | 'new' | 'generating' | 'editor' | 'preview'>('home');
+  const [currentView, setCurrentView] = useState<'chat' | 'home' | 'new' | 'generating' | 'editor' | 'preview'>('chat');
   const [projects, setProjects] = useState<VideoProject[]>([]);
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
   const [newProjectInitial, setNewProjectInitial] = useState<{ title: string; script: string } | undefined>(undefined);
@@ -125,69 +128,91 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 font-sans selection:bg-indigo-500/30 selection:text-indigo-200">
-      {/* Offline Toast Banner */}
-      {!isOnline && (
-        <div className="fixed top-2 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 rounded-xl bg-amber-500 px-3.5 py-1.5 text-xs font-semibold text-slate-950 shadow-lg animate-bounce">
-          <WifiOff className="w-3.5 h-3.5" />
-          <span>Sin conexión a internet. Los datos y videos guardados siguen disponibles.</span>
-        </div>
-      )}
+    <ToastProvider>
+      <div className="min-h-screen bg-slate-950 text-slate-100 font-sans selection:bg-indigo-500/30 selection:text-indigo-200">
+        {/* Offline Toast Banner */}
+        {!isOnline && (
+          <div className="fixed top-2 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 rounded-xl bg-amber-500 px-3.5 py-1.5 text-xs font-semibold text-slate-950 shadow-lg animate-bounce">
+            <WifiOff className="w-3.5 h-3.5" />
+            <span>Sin conexión a internet. Los datos y videos guardados siguen disponibles.</span>
+          </div>
+        )}
 
-      {/* Screen Routing */}
-      {currentView === 'home' && (
-        <HomeView
-          projects={projects}
-          onNewProject={handleNewProject}
-          onOpenProject={handleOpenProject}
-          onDeleteProject={handleDeleteProject}
-          onDuplicateProject={handleDuplicateProject}
-        />
-      )}
+        {/* PWA Update Notice */}
+        <PWAUpdatePrompt />
 
-      {currentView === 'new' && (
-        <NewProjectView
-          initialData={newProjectInitial}
-          onCancel={() => setCurrentView('home')}
-          onGenerate={handleStartGeneration}
-        />
-      )}
+        {/* Screen Routing */}
+        {currentView === 'chat' && (
+          <ChatView
+            currentProject={activeProject}
+            allProjects={projects}
+            onSelectProject={(projectId) => {
+              setActiveProjectId(projectId);
+            }}
+            onNewChat={() => {
+              setActiveProjectId(null);
+            }}
+            onOpenEditor={() => {
+              setCurrentView('editor');
+            }}
+            onProjectUpdated={handleProjectUpdated}
+          />
+        )}
 
-      {currentView === 'generating' && activeProject && (
-        <GeneratingView
-          project={activeProject}
-          testMode={isTestMode}
-          onProjectUpdated={handleProjectUpdated}
-          onComplete={() => setCurrentView('preview')}
-          onCancel={() => {
-            loadProjects();
-            setCurrentView('home');
-          }}
-        />
-      )}
+        {currentView === 'home' && (
+          <HomeView
+            projects={projects}
+            onNewProject={handleNewProject}
+            onOpenProject={handleOpenProject}
+            onDeleteProject={handleDeleteProject}
+            onDuplicateProject={handleDuplicateProject}
+          />
+        )}
 
-      {currentView === 'editor' && activeProject && (
-        <EditorView
-          project={activeProject}
-          onProjectUpdated={handleProjectUpdated}
-          onPreviewExport={() => setCurrentView('preview')}
-          onBack={() => {
-            loadProjects();
-            setCurrentView('home');
-          }}
-        />
-      )}
+        {currentView === 'new' && (
+          <NewProjectView
+            initialData={newProjectInitial}
+            onCancel={() => setCurrentView('chat')}
+            onGenerate={handleStartGeneration}
+          />
+        )}
 
-      {currentView === 'preview' && activeProject && (
-        <PreviewExportView
-          project={activeProject}
-          onEditScenes={() => setCurrentView('editor')}
-          onBack={() => {
-            loadProjects();
-            setCurrentView('home');
-          }}
-        />
-      )}
-    </div>
+        {currentView === 'generating' && activeProject && (
+          <GeneratingView
+            project={activeProject}
+            testMode={isTestMode}
+            onProjectUpdated={handleProjectUpdated}
+            onComplete={() => setCurrentView('preview')}
+            onCancel={() => {
+              loadProjects();
+              setCurrentView('chat');
+            }}
+          />
+        )}
+
+        {currentView === 'editor' && activeProject && (
+          <EditorView
+            project={activeProject}
+            onProjectUpdated={handleProjectUpdated}
+            onPreviewExport={() => setCurrentView('preview')}
+            onBack={() => {
+              loadProjects();
+              setCurrentView('chat');
+            }}
+          />
+        )}
+
+        {currentView === 'preview' && activeProject && (
+          <PreviewExportView
+            project={activeProject}
+            onEditScenes={() => setCurrentView('editor')}
+            onBack={() => {
+              loadProjects();
+              setCurrentView('chat');
+            }}
+          />
+        )}
+      </div>
+    </ToastProvider>
   );
 }

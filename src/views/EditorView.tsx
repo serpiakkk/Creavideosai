@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   ArrowLeft,
   Play,
@@ -18,6 +18,7 @@ import {
 import { CameraMotion, SceneItem, SceneTransition, VideoProject } from '../types';
 import { saveProject } from '../services/db';
 import { generateImageWithGemini, generateVoiceWithGemini, getAudioDuration } from '../services/geminiService';
+import { useToast } from '../components/Toast';
 
 interface EditorViewProps {
   project: VideoProject;
@@ -38,16 +39,26 @@ export const EditorView: React.FC<EditorViewProps> = ({
   const [isPlayingAudio, setIsPlayingAudio] = useState(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
 
+  const { showToast } = useToast();
+  const projectRef = useRef<VideoProject>(project);
+
+  useEffect(() => {
+    projectRef.current = project;
+  }, [project]);
+
   const currentScene = project.scenes[selectedSceneIndex] || project.scenes[0];
 
+  // Requisito 25: Dejar de mutar directamente. Actualizaciones inmutables y ref con último proyecto
   const updateScene = async (updatedFields: Partial<SceneItem>) => {
-    if (!currentScene) return;
-    const newScenes = [...project.scenes];
-    newScenes[selectedSceneIndex] = {
-      ...currentScene,
-      ...updatedFields,
-    };
-    const updatedProj = { ...project, scenes: newScenes };
+    const currentProj = projectRef.current;
+    const targetScene = currentProj.scenes[selectedSceneIndex];
+    if (!targetScene) return;
+
+    const newScenes = currentProj.scenes.map((s: SceneItem, idx: number) =>
+      idx === selectedSceneIndex ? { ...s, ...updatedFields } : s
+    );
+    const updatedProj: VideoProject = { ...currentProj, scenes: newScenes, updatedAt: Date.now() };
+    projectRef.current = updatedProj;
     onProjectUpdated(updatedProj);
     await saveProject(updatedProj);
   };
@@ -91,10 +102,12 @@ export const EditorView: React.FC<EditorViewProps> = ({
         project.voiceTone
       );
       const measuredDuration = await getAudioDuration(res.audioUrl);
+      // Requisito 3: Duración de escena = max(2.5, duración de la voz + 0.3 s)
       await updateScene({
         audioUrl: res.audioUrl,
-        duration: Math.max(2.5, measuredDuration),
+        duration: Math.max(2.5, measuredDuration + 0.3),
         status: 'ready',
+        voiceOutdated: false,
       });
       setStatusMessage('¡Voz actualizada con duración exacta!');
     } catch (err: any) {
@@ -154,7 +167,7 @@ export const EditorView: React.FC<EditorViewProps> = ({
 
   const handleDeleteScene = async () => {
     if (project.scenes.length <= 1) {
-      alert('El video debe tener al menos una escena.');
+      showToast('El video debe tener al menos una escena.', 'error');
       return;
     }
 
@@ -166,6 +179,7 @@ export const EditorView: React.FC<EditorViewProps> = ({
     const updatedProj = { ...project, scenes: newScenes };
     onProjectUpdated(updatedProj);
     await saveProject(updatedProj);
+    showToast('Escena eliminada', 'info');
   };
 
   const handleAddScene = async () => {
@@ -387,9 +401,16 @@ export const EditorView: React.FC<EditorViewProps> = ({
                 {/* Narration Textarea */}
                 <div>
                   <div className="flex items-center justify-between mb-1.5">
-                    <label className="text-xs font-bold uppercase tracking-wider text-slate-400">
-                      Texto de narración y subtítulos
-                    </label>
+                    <div className="flex items-center gap-2">
+                      <label className="text-xs font-bold uppercase tracking-wider text-slate-400">
+                        Texto de narración y subtítulos
+                      </label>
+                      {(currentScene.voiceOutdated || currentScene.status === 'outdated_voice') && (
+                        <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40 animate-pulse">
+                          Voz desactualizada
+                        </span>
+                      )}
+                    </div>
                     <div className="flex items-center gap-1.5">
                       {currentScene.audioUrl && (
                         <button
@@ -404,7 +425,11 @@ export const EditorView: React.FC<EditorViewProps> = ({
                       <button
                         onClick={handleRegenerateVoice}
                         disabled={isRegeneratingVoice}
-                        className="flex items-center gap-1 text-[11px] font-semibold text-violet-400 hover:text-violet-300 px-2 py-0.5 rounded bg-slate-800"
+                        className={`flex items-center gap-1 text-[11px] font-semibold px-2.5 py-1 rounded-lg transition ${
+                          currentScene.voiceOutdated || currentScene.status === 'outdated_voice'
+                            ? 'bg-amber-600 hover:bg-amber-500 text-white font-bold shadow-md shadow-amber-600/30'
+                            : 'bg-slate-800 text-violet-400 hover:text-violet-300'
+                        }`}
                       >
                         <Volume2 className={`w-3 h-3 ${isRegeneratingVoice ? 'animate-pulse' : ''}`} />
                         <span>{isRegeneratingVoice ? 'Grabando...' : 'Regenerar voz'}</span>
@@ -412,11 +437,22 @@ export const EditorView: React.FC<EditorViewProps> = ({
                     </div>
                   </div>
 
+                  {/* Requisito 12: Al editar texto de narración, marcar la voz como desactualizada y no regenerar solo */}
                   <textarea
                     value={currentScene.narrationText}
-                    onChange={(e) => updateScene({ narrationText: e.target.value })}
+                    onChange={(e) =>
+                      updateScene({
+                        narrationText: e.target.value,
+                        status: 'outdated_voice',
+                        voiceOutdated: true,
+                      })
+                    }
                     rows={4}
-                    className="w-full rounded-xl border border-slate-800 bg-slate-900/90 p-3 text-sm text-slate-100 focus:outline-none focus:border-indigo-500 leading-relaxed"
+                    className={`w-full rounded-xl border bg-slate-900/90 p-3 text-sm text-slate-100 focus:outline-none leading-relaxed transition ${
+                      currentScene.voiceOutdated || currentScene.status === 'outdated_voice'
+                        ? 'border-amber-500/50 focus:border-amber-500'
+                        : 'border-slate-800 focus:border-indigo-500'
+                    }`}
                   ></textarea>
                 </div>
 

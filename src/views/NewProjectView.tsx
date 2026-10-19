@@ -16,7 +16,8 @@ import {
 import { AspectRatio, BackgroundMusicConfig, VideoProject } from '../types';
 import { DEMO_SCRIPTS, GEMINI_VOICES, VISUAL_PRESETS } from '../utils/constants';
 import { PRESET_TRACKS } from '../services/audioLibrary';
-import { generateVoiceWithGemini } from '../services/geminiService';
+import { generateVoiceWithGemini, enhanceScriptWithGemini } from '../services/geminiService';
+import { useToast } from '../components/Toast';
 
 interface NewProjectViewProps {
   initialData?: { title: string; script: string };
@@ -48,6 +49,28 @@ export const NewProjectView: React.FC<NewProjectViewProps> = ({
   const [isPlayingSample, setIsPlayingSample] = useState(false);
   const [sampleError, setSampleError] = useState<string | null>(null);
   const [currentAudio, setCurrentAudio] = useState<HTMLAudioElement | null>(null);
+  const { showToast } = useToast();
+  const [isEnhancingScript, setIsEnhancingScript] = useState(false);
+
+  const handleEnhanceScript = async () => {
+    if (!script.trim()) {
+      showToast('Escribe primero algunas ideas o borrador para que la IA lo optimice.', 'info');
+      return;
+    }
+    setIsEnhancingScript(true);
+    try {
+      const res = await enhanceScriptWithGemini(script, voiceTone);
+      if (res.title && !title.trim()) {
+        setTitle(res.title);
+      }
+      setScript(res.enhancedScript);
+      showToast('¡Guion optimizado y estructurado con éxito por Gemini!', 'success');
+    } catch (err: any) {
+      showToast('No se pudo optimizar con IA. Puedes usar el formato manual o un ejemplo.', 'error');
+    } finally {
+      setIsEnhancingScript(false);
+    }
+  };
 
   const handlePresetSelect = (presetId: string) => {
     setSelectedPresetId(presetId);
@@ -108,7 +131,7 @@ export const NewProjectView: React.FC<NewProjectViewProps> = ({
 
   const handleStartGeneration = (testMode: boolean) => {
     if (!script.trim()) {
-      alert('Por favor escribe o pega un guion antes de generar el video.');
+      showToast('Por favor escribe o pega un guion antes de generar el video.', 'error');
       return;
     }
 
@@ -183,11 +206,22 @@ export const NewProjectView: React.FC<NewProjectViewProps> = ({
             <div className="flex items-center gap-2">
               <button
                 type="button"
+                onClick={handleEnhanceScript}
+                disabled={isEnhancingScript}
+                className="flex items-center gap-1 rounded-lg bg-indigo-600/30 border border-indigo-500/40 px-2 py-1 text-[11px] font-bold text-indigo-300 hover:bg-indigo-600/50 active:scale-95 transition"
+                title="Estructura y optimiza automáticamente tus notas con Gemini 3.8 Flash"
+              >
+                <Sparkles className={`w-3 h-3 ${isEnhancingScript ? 'animate-spin text-amber-400' : 'text-amber-400'}`} />
+                <span>{isEnhancingScript ? 'Mejorando...' : 'Mejorar con IA'}</span>
+              </button>
+              <button
+                type="button"
                 onClick={() => {
                   setTitle(DEMO_SCRIPTS[0].title);
                   setScript(DEMO_SCRIPTS[0].script);
+                  showToast('Ejemplo cargado con éxito', 'info');
                 }}
-                className="text-[11px] font-semibold text-indigo-400 hover:text-indigo-300 transition"
+                className="text-[11px] font-semibold text-slate-400 hover:text-white transition px-1"
               >
                 Cargar ejemplo
               </button>

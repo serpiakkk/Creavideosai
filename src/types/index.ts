@@ -4,7 +4,7 @@ export type CameraMotion = 'zoom_in' | 'zoom_out' | 'pan_left' | 'pan_right' | '
 
 export type SceneTransition = 'fade' | 'cut' | 'crossfade';
 
-export type SceneStatus = 'pending' | 'generating_image' | 'generating_voice' | 'ready' | 'error';
+export type SceneStatus = 'pending' | 'generating_image' | 'generating_voice' | 'ready' | 'error' | 'outdated_voice';
 
 export type ProjectStatus = 'draft' | 'generating' | 'ready' | 'error' | 'paused';
 
@@ -16,12 +16,14 @@ export interface SceneItem {
   visualDescription: string;
   visualPrompt: string;
   imageUrl?: string; // data URL or blob URL
-  audioUrl?: string; // data URL or blob URL
+  isFallbackImage?: boolean; // True if created by SVG fallback generator
+  audioUrl?: string; // data URL
   audioBlob?: Blob;
   duration: number; // in seconds
   cameraMotion: CameraMotion;
   transition: SceneTransition;
   status: SceneStatus;
+  voiceOutdated?: boolean;
   errorMessage?: string;
   keywords?: string[];
 }
@@ -34,6 +36,20 @@ export interface BackgroundMusicConfig {
   presetType?: 'lofi' | 'upbeat' | 'cinematic' | 'corporate';
   customFileName?: string;
   customAudioUrl?: string;
+}
+
+export interface ChatMessage {
+  id: string;
+  sender: 'user' | 'assistant';
+  timestamp: number;
+  text: string;
+  attachment?: {
+    name: string;
+    type: 'script' | 'music' | 'image';
+    snippet?: string;
+  };
+  widgetType?: 'script_parsed' | 'generating_progress' | 'video_ready' | 'quota_alert' | 'fallback_image_prompt';
+  widgetData?: any;
 }
 
 export interface VideoProject {
@@ -52,6 +68,9 @@ export interface VideoProject {
   scenes: SceneItem[];
   currentSceneIndex?: number;
   testMode?: boolean; // If tested with only 2 scenes
+  thumbnailSubtitle?: string; // Editable subtitle for YouTube thumbnail
+  fallbackImagePreference?: 'ask' | 'use_fallback' | 'wait_retry';
+  chatHistory?: ChatMessage[];
 }
 
 export interface VisualPreset {

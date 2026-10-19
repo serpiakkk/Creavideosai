@@ -22,6 +22,7 @@ import JSZip from 'jszip';
 import { VideoProject, YouTubeMetadata } from '../types';
 import { VideoComposer } from '../services/videoComposer';
 import { generateYouTubeMetadata } from '../services/geminiService';
+import { useToast } from '../components/Toast';
 
 interface PreviewExportViewProps {
   project: VideoProject;
@@ -44,9 +45,11 @@ export const PreviewExportView: React.FC<PreviewExportViewProps> = ({
   );
   const [currentSceneIndex, setCurrentSceneIndex] = useState(0);
 
+  const { showToast } = useToast();
+
   // Audio Testing & Normalization States
   const [isTestingVoice, setIsTestingVoice] = useState(false);
-  const [voiceBooster, setVoiceBooster] = useState(1.35); // 135% normalized volume
+  const [voiceBooster, setVoiceBooster] = useState(1.45); // 145% normalized volume
   const [audioStatusText, setAudioStatusText] = useState('Voz normalizada lista');
 
   // Export States
@@ -160,9 +163,10 @@ export const PreviewExportView: React.FC<PreviewExportViewProps> = ({
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
+      showToast('¡Video exportado y descargado con éxito!', 'success');
     } catch (err) {
       console.error('Error al exportar video:', err);
-      alert('Hubo un inconveniente al empaquetar el video. Intenta de nuevo.');
+      showToast('Hubo un inconveniente al empaquetar el video. Intenta de nuevo.', 'error');
     } finally {
       setIsExportingVideo(false);
     }
@@ -180,13 +184,14 @@ export const PreviewExportView: React.FC<PreviewExportViewProps> = ({
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
+    showToast('Subtítulos .SRT descargados con éxito', 'success');
   };
 
   // 3. Export Audio Only (WAV)
   const handleExportAudio = () => {
     const firstAudioScene = project.scenes.find((s) => s.audioUrl);
     if (!firstAudioScene?.audioUrl) {
-      alert('No hay audios disponibles para descargar.');
+      showToast('No hay audios disponibles para descargar.', 'error');
       return;
     }
     const a = document.createElement('a');
@@ -195,6 +200,7 @@ export const PreviewExportView: React.FC<PreviewExportViewProps> = ({
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
+    showToast('Pista de audio descargada', 'success');
   };
 
   // 4. Export Images as ZIP
@@ -215,7 +221,7 @@ export const PreviewExportView: React.FC<PreviewExportViewProps> = ({
     }
 
     if (count === 0) {
-      alert('No hay imágenes disponibles para descargar.');
+      showToast('No hay imágenes disponibles para descargar.', 'error');
       return;
     }
 
@@ -227,6 +233,7 @@ export const PreviewExportView: React.FC<PreviewExportViewProps> = ({
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
+    showToast('Archivo ZIP con todas las imágenes descargado', 'success');
   };
 
   // 5. Share Video
@@ -241,7 +248,7 @@ export const PreviewExportView: React.FC<PreviewExportViewProps> = ({
       } catch {}
     } else {
       navigator.clipboard.writeText(window.location.href);
-      alert('¡Enlace del proyecto copiado al portapapeles!');
+      showToast('¡Enlace del proyecto copiado al portapapeles!', 'info');
     }
   };
 
@@ -256,7 +263,7 @@ export const PreviewExportView: React.FC<PreviewExportViewProps> = ({
       setYoutubeMetadata(metadata);
     } catch (err: any) {
       console.error(err);
-      alert('Error al generar metadatos de YouTube con Gemini.');
+      showToast('Error al generar metadatos de YouTube con Gemini.', 'error');
     } finally {
       setIsGeneratingSEO(false);
     }

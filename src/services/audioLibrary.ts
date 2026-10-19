@@ -60,7 +60,13 @@ export function createSynthesizedMusicBuffer(
   };
 
   const notes = scales[presetType] || scales.lofi;
-  const bpm = presetType === 'upbeat' ? 120 : presetType === 'lofi' ? 80 : 70;
+  const bpmTable: Record<string, number> = {
+    upbeat: 124,
+    lofi: 82,
+    cinematic: 70,
+    corporate: 105,
+  };
+  const bpm = bpmTable[presetType] || 82;
   const beatDuration = 60 / bpm;
 
   for (let i = 0; i < numFrames; i++) {
@@ -95,5 +101,23 @@ export function createSynthesizedMusicBuffer(
     right[i] = pad * 0.8 + kick - noise;
   }
 
+  return buffer;
+}
+
+// Global cache for synthesized music buffers by preset type and sampleRate
+const synthBufferCache = new Map<string, AudioBuffer>();
+
+export function getSynthesizedMusicBuffer(
+  audioCtx: AudioContext,
+  presetType: 'lofi' | 'upbeat' | 'cinematic' | 'corporate',
+  durationSeconds: number = 30
+): AudioBuffer {
+  const cacheKey = `${presetType}_${audioCtx.sampleRate}_${durationSeconds}`;
+  const existing = synthBufferCache.get(cacheKey);
+  if (existing) {
+    return existing;
+  }
+  const buffer = createSynthesizedMusicBuffer(audioCtx, presetType, durationSeconds);
+  synthBufferCache.set(cacheKey, buffer);
   return buffer;
 }

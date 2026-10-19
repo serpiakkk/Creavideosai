@@ -59,16 +59,64 @@ export async function getProjectById(id: string): Promise<VideoProject | null> {
   }
 }
 
+async function blobUrlToDataUrl(url: string): Promise<string> {
+  if (!url || !url.startsWith('blob:')) return url;
+  try {
+    const res = await fetch(url);
+    const blob = await res.blob();
+    return new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onloadend = () => resolve(reader.result as string);
+      reader.onerror = () => resolve(url);
+      reader.readAsDataURL(blob);
+    });
+  } catch (err) {
+    console.warn('No se pudo convertir blob URL a Data URL:', err);
+    return url;
+  }
+}
+
 export async function saveProject(project: VideoProject): Promise<void> {
   try {
     const db = await openDB();
+
+    // Requisito 20: Nunca guardar enlaces blob: (se rompen al cerrar la app)
+    const sanitizedScenes = await Promise.all(
+      (project.scenes || []).map(async (scene) => {
+        let imageUrl = scene.imageUrl;
+        let audioUrl = scene.audioUrl;
+        if (imageUrl?.startsWith('blob:')) {
+          imageUrl = await blobUrlToDataUrl(imageUrl);
+        }
+        if (audioUrl?.startsWith('blob:')) {
+          audioUrl = await blobUrlToDataUrl(audioUrl);
+        }
+        return {
+          ...scene,
+          imageUrl,
+          audioUrl,
+        };
+      })
+    );
+
+    let customMusicUrl = project.music?.customAudioUrl;
+    if (customMusicUrl?.startsWith('blob:')) {
+      customMusicUrl = await blobUrlToDataUrl(customMusicUrl);
+    }
+
+    const updatedProject: VideoProject = {
+      ...project,
+      scenes: sanitizedScenes,
+      music: {
+        ...project.music,
+        customAudioUrl: customMusicUrl,
+      },
+      updatedAt: Date.now(),
+    };
+
     return new Promise((resolve, reject) => {
       const transaction = db.transaction(STORE_PROJECTS, 'readwrite');
       const store = transaction.objectStore(STORE_PROJECTS);
-      const updatedProject = {
-        ...project,
-        updatedAt: Date.now(),
-      };
       const request = store.put(updatedProject);
 
       request.onsuccess = () => resolve();

@@ -1,4 +1,4 @@
-import { AspectRatio, SceneItem, YouTubeMetadata } from '../types';
+import { AspectRatio, SceneItem, YouTubeMetadata, VideoProject } from '../types';
 
 export interface ParsedScene {
   title: string;
@@ -19,6 +19,7 @@ export interface ParseScriptResult {
 export interface GenerateImageResult {
   imageUrl: string;
   modelUsed: string;
+  isFallback: boolean;
 }
 
 export interface GenerateVoiceResult {
@@ -27,31 +28,235 @@ export interface GenerateVoiceResult {
   modelUsed: string;
 }
 
-// 1. Parse Script
+// --------------------------------------------------------------------------
+// Script Chunking & Local Visual Extraction (Requisitos 9 y 10)
+// --------------------------------------------------------------------------
+
+export interface ScriptBlock {
+  blockIndex: number;
+  headerTitle: string;
+  localVisualDescription?: string;
+  rawContent: string;
+}
+
+export function splitScriptIntoBlocks(rawScript: string): ScriptBlock[] {
+  const lines = rawScript.split('\n');
+  const blocks: ScriptBlock[] = [];
+  let currentTitle = '';
+  let currentLines: string[] = [];
+  let currentVisualDesc = '';
+
+  const flushBlock = () => {
+    if (currentLines.length === 0 && !currentTitle) return;
+    const content = currentLines.join('\n').trim();
+    if (content || currentTitle) {
+      blocks.push({
+        blockIndex: blocks.length,
+        headerTitle: currentTitle || `Escena ${blocks.length + 1}`,
+        localVisualDescription: currentVisualDesc,
+        rawContent: content,
+      });
+    }
+    currentLines = [];
+    currentVisualDesc = '';
+  };
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    const isHeader =
+      /^##\s+/i.test(trimmed) ||
+      /^ESCENA\s+\d+/i.test(trimmed) ||
+      /^NÚMERO\s+\d+/i.test(trimmed) ||
+      /^NUMERO\s+\d+/i.test(trimmed) ||
+      /^\d+[\.\)]\s+[A-ZÁÉÍÓÚ]/i.test(trimmed);
+
+    if (isHeader) {
+      flushBlock();
+      currentTitle = trimmed.replace(/^##\s*/, '').trim();
+    } else if (/^(IMAGEN|IMÁGEN|VISUAL):\s*/i.test(trimmed)) {
+      // Requisito 10: Las líneas "IMAGEN:" se extraen localmente en el cliente como visualDescription; nunca deben entrar en narrationText.
+      const extracted = trimmed.replace(/^(IMAGEN|IMÁGEN|VISUAL):\s*/i, '').trim();
+      currentVisualDesc = currentVisualDesc ? `${currentVisualDesc}. ${extracted}` : extracted;
+    } else {
+      currentLines.push(line);
+    }
+  }
+  flushBlock();
+
+  // If no structured headers were detected, split into paragraphs
+  if (blocks.length <= 1 && rawScript.length > 250) {
+    const paragraphs = rawScript.split(/\n\s*\n/).filter((p) => p.trim().length > 0);
+    if (paragraphs.length > 1) {
+      return paragraphs.map((para, idx) => {
+        const paraLines = para.split('\n');
+        let visDesc = '';
+        const cleanLines: string[] = [];
+        for (const pl of paraLines) {
+          const pt = pl.trim();
+          if (/^(IMAGEN|IMÁGEN|VISUAL):\s*/i.test(pt)) {
+            visDesc = pt.replace(/^(IMAGEN|IMÁGEN|VISUAL):\s*/i, '').trim();
+          } else {
+            cleanLines.push(pl);
+          }
+        }
+        return {
+          blockIndex: idx,
+          headerTitle: `Escena ${idx + 1}`,
+          localVisualDescription: visDesc,
+          rawContent: cleanLines.join('\n').trim(),
+        };
+      });
+    }
+  }
+
+  return blocks.length > 0 ? blocks : [{
+    blockIndex: 0,
+    headerTitle: 'Escena 1',
+    localVisualDescription: '',
+    rawContent: rawScript.trim(),
+  }];
+}
+
+// 1. Parse Script en bloques (Requisito 9)
 export async function parseScriptWithGemini(
   script: string,
   visualStyle: string,
   maxScenes?: number
 ): Promise<ParseScriptResult> {
-  const response = await fetch('/api/script/parse', {
+  const blocks = splitScriptIntoBlocks(script);
+
+  // If in testMode with maxScenes, restrict blocks
+  const targetBlocks = maxScenes ? blocks.slice(0, maxScenes) : blocks;
+
+  // Group into chunks of 3 to 4 blocks per call
+  const CHUNK_SIZE = 3;
+  const chunkedBlocks: ScriptBlock[][] = [];
+  for (let i = 0; i < targetBlocks.length; i += CHUNK_SIZE) {
+    chunkedBlocks.push(targetBlocks.slice(i, i + CHUNK_SIZE));
+  }
+
+  const allScenes: ParsedScene[] = [];
+  let suggestedTitle = '';
+  let modelUsed = 'gemini-3.8-flash';
+
+  for (let chunkIdx = 0; chunkIdx < chunkedBlocks.length; chunkIdx++) {
+    const chunk = chunkedBlocks[chunkIdx];
+    const chunkScript = chunk
+      .map((b) => `## ${b.headerTitle}\n${b.localVisualDescription ? `IMAGEN: ${b.localVisualDescription}\n` : ''}${b.rawContent}`)
+      .join('\n\n');
+
+    let chunkSuccess = false;
+    let attempts = 0;
+
+    while (!chunkSuccess && attempts < 2) {
+      attempts++;
+      try {
+        const response = await fetch('/api/script/parse', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            script: chunkScript,
+            visualStyle,
+            maxOutputTokens: 8192,
+          }),
+        });
+
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.error || `Error al procesar bloque ${chunkIdx + 1}`);
+        }
+
+        if (data.title && !suggestedTitle) {
+          suggestedTitle = data.title;
+        }
+
+        const chunkScenes: ParsedScene[] = (data.scenes || []).map((sc: any, idx: number) => {
+          const correspondingBlock = chunk[idx] || chunk[chunk.length - 1];
+          // Ensure visualDescription incorporates local extraction if present
+          const finalVisualDesc = correspondingBlock?.localVisualDescription || sc.visualDescription || sc.title;
+          // Ensure narrationText never has IMAGEN: or visual notes
+          const cleanNarration = (sc.narrationText || '')
+            .replace(/^(IMAGEN|IMÁGEN|VISUAL):.*$/gim, '')
+            .replace(/\(([^)]*)\)/g, '')
+            .trim();
+
+          return {
+            title: sc.title || correspondingBlock?.headerTitle || `Escena ${allScenes.length + idx + 1}`,
+            narrationText: cleanNarration,
+            visualDescription: finalVisualDesc,
+            visualPrompt: sc.visualPrompt || `${visualStyle}: ${finalVisualDesc}`,
+            estimatedDuration: sc.estimatedDuration || 4.0,
+            cameraMotion: sc.cameraMotion || 'zoom_in',
+            keywords: sc.keywords || [],
+          };
+        });
+
+        allScenes.push(...chunkScenes);
+        modelUsed = data.modelUsed || modelUsed;
+        chunkSuccess = true;
+      } catch (err: any) {
+        console.warn(`Intento ${attempts} falló en bloque ${chunkIdx + 1}:`, err?.message);
+        if (attempts >= 2) {
+          // Fallback local solo para este bloque, sin perder los demás
+          console.warn(`Usando estructuración local para el bloque ${chunkIdx + 1}`);
+          const fallbackScenes: ParsedScene[] = chunk.map((b, idx) => ({
+            title: b.headerTitle,
+            narrationText: b.rawContent.replace(/^(IMAGEN|IMÁGEN|VISUAL):.*$/gim, '').trim(),
+            visualDescription: b.localVisualDescription || b.headerTitle,
+            visualPrompt: `${visualStyle}: ${b.localVisualDescription || b.headerTitle}`,
+            estimatedDuration: Math.max(3.0, (b.rawContent.split(/\s+/).length / 2.4)),
+            cameraMotion: 'zoom_in',
+            keywords: ['resumen', 'clave'],
+          }));
+          allScenes.push(...fallbackScenes);
+          chunkSuccess = true;
+        } else {
+          await new Promise((r) => setTimeout(r, 1000));
+        }
+      }
+    }
+  }
+
+  return {
+    title: suggestedTitle || (blocks[0]?.headerTitle || 'Nuevo Video'),
+    scenes: allScenes.length > 0 ? allScenes : [
+      {
+        title: 'Escena 1',
+        narrationText: script.replace(/^(IMAGEN|IMÁGEN|VISUAL):.*$/gim, '').trim(),
+        visualDescription: 'Ilustración explicativa de la escena',
+        visualPrompt: `${visualStyle}: Ilustración explicativa`,
+        estimatedDuration: 4.5,
+        cameraMotion: 'zoom_in',
+        keywords: ['video'],
+      },
+    ],
+    modelUsed,
+  };
+}
+
+// 1.1 Enhance Script with Gemini
+export async function enhanceScriptWithGemini(
+  script: string,
+  tone?: string
+): Promise<{ title: string; enhancedScript: string }> {
+  const response = await fetch('/api/script/enhance', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ script, visualStyle, maxScenes }),
+    body: JSON.stringify({ script, tone }),
   });
 
   const data = await response.json();
   if (!response.ok) {
-    throw new Error(data.error || 'Error al procesar el guion con Gemini.');
+    throw new Error(data.error || 'Error al optimizar el guion con Gemini.');
   }
 
   return {
     title: data.title,
-    scenes: data.scenes,
-    modelUsed: data.modelUsed,
+    enhancedScript: data.enhancedScript,
   };
 }
 
-// 2. Generate Image
+// 2. Generate Image (Requisito 5: lee isFallback)
 export async function generateImageWithGemini(
   prompt: string,
   aspectRatio: AspectRatio,
@@ -79,40 +284,50 @@ export async function generateImageWithGemini(
   return {
     imageUrl: data.imageUrl,
     modelUsed: data.modelUsed,
+    isFallback: Boolean(data.isFallback),
   };
 }
 
-// 3. Generate Voice (TTS)
+// 3. Generate Voice (TTS) - Requisito 1: falla limpiamente ante cuota sin falso zumbido
 export async function generateVoiceWithGemini(
   text: string,
   voiceName: string = 'Kore',
   speed: number = 1.1,
   tone: string = 'informativo'
 ): Promise<GenerateVoiceResult> {
-  try {
-    const response = await fetch('/api/voice/generate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, voiceName, speed, tone }),
-    });
+  const response = await fetch('/api/voice/generate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text, voiceName, speed, tone }),
+  });
 
-    const data = await response.json();
-    if (!response.ok) {
-      const error: any = new Error(data.error || 'Error al sintetizar voz con Gemini TTS.');
-      error.isQuotaError = data.isQuotaError || response.status === 429;
-      throw error;
-    }
-
-    return {
-      audioUrl: data.audioUrl,
-      voiceName: data.voiceName,
-      modelUsed: data.modelUsed,
-    };
-  } catch (err: any) {
-    // If quota is exhausted or network failed, we offer browser fallback if requested
-    console.warn('Fallo en Gemini TTS, evaluando fallback...', err);
-    throw err;
+  const data = await response.json();
+  if (!response.ok) {
+    const error: any = new Error(data.error || 'Error al sintetizar voz con Gemini TTS.');
+    error.isQuotaError = data.isQuotaError || response.status === 429;
+    throw error;
   }
+
+  return {
+    audioUrl: data.audioUrl,
+    voiceName: data.voiceName,
+    modelUsed: data.modelUsed,
+  };
+}
+
+// Requisito 4: Muestra de voz en memoria para no gastar cuota cada vez
+const voiceSampleCache = new Map<string, string>();
+
+export async function getVoiceSample(
+  voiceName: string,
+  sampleText: string = 'Hola, esta es una muestra de mi voz generada por Gemini.'
+): Promise<string> {
+  if (voiceSampleCache.has(voiceName)) {
+    return voiceSampleCache.get(voiceName)!;
+  }
+  const result = await generateVoiceWithGemini(sampleText, voiceName, 1.0, 'informativo');
+  voiceSampleCache.set(voiceName, result.audioUrl);
+  return result.audioUrl;
 }
 
 // 4. Generate YouTube Metadata
@@ -134,117 +349,62 @@ export async function generateYouTubeMetadata(
   return data.metadata;
 }
 
-// Helper: Measure real duration of audio from a data URL or Blob URL
-export async function getAudioDuration(audioUrl: string): Promise<number> {
-  return new Promise((resolve) => {
-    const audio = new Audio();
-    audio.src = audioUrl;
+// 5. Send Chat Natural Language Command
+export interface ChatCommandResult {
+  success: boolean;
+  understood: boolean;
+  actionType: 'change_voice' | 'change_aspect_ratio' | 'change_style' | 'change_music' | 'regenerate_image' | 'regenerate_voice' | 'unknown';
+  parameters?: {
+    voiceName?: string;
+    aspectRatio?: AspectRatio;
+    visualStyle?: string;
+    presetType?: string;
+    sceneIndex?: number;
+    customPrompt?: string;
+    question?: string;
+  };
+  replyMessage: string;
+}
 
-    const onLoaded = () => {
-      const dur = audio.duration;
-      cleanup();
-      resolve(Number.isFinite(dur) && dur > 0 ? dur : 4.0);
-    };
-
-    const onError = () => {
-      cleanup();
-      resolve(4.0); // Safe fallback duration in seconds
-    };
-
-    const cleanup = () => {
-      audio.removeEventListener('loadedmetadata', onLoaded);
-      audio.removeEventListener('error', onError);
-    };
-
-    audio.addEventListener('loadedmetadata', onLoaded);
-    audio.addEventListener('error', onError);
-
-    // Safari / mobile safety timeout
-    setTimeout(() => {
-      cleanup();
-      resolve(4.0);
-    }, 5000);
+export async function sendChatCommand(
+  userMessage: string,
+  currentProject: VideoProject
+): Promise<ChatCommandResult> {
+  const response = await fetch('/api/chat/command', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ userMessage, currentProject }),
   });
+
+  const data = await response.json();
+  return data;
 }
 
-// Fallback: Browser Web Speech API synthesizer when offline or quota is locked
-export async function generateBrowserSpeechFallback(
-  text: string,
-  speed: number = 1.0
-): Promise<{ audioUrl: string; duration: number }> {
-  // Estimate duration based on word count (~2.4 words per second)
-  const words = text.trim().split(/\s+/).length;
-  const estimatedSeconds = Math.max(3.0, (words / 2.4) / speed);
-
-  // Synthesize a clean, subtle audio chime track with Web Audio API for the duration
-  // so the video composer receives an actual playable audio file
-  const sampleRate = 24000;
-  const numFrames = Math.floor(sampleRate * estimatedSeconds);
-  const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate });
-  const buffer = audioCtx.createBuffer(1, numFrames, sampleRate);
-  const channelData = buffer.getChannelData(0);
-
-  // Soft speech-like carrier tone with cadence envelope
-  for (let i = 0; i < numFrames; i++) {
-    const t = i / sampleRate;
-    const wordCadence = Math.sin(t * 8) * 0.5 + 0.5;
-    const tone = Math.sin(2 * Math.PI * 180 * t) * 0.05 + Math.sin(2 * Math.PI * 320 * t) * 0.03;
-    channelData[i] = tone * wordCadence;
+// Requisito 3: La duración de cada escena debe salir del AudioBuffer ya decodificado (buffer.duration)
+let sharedAudioCtx: AudioContext | null = null;
+function getSharedAudioContext(): AudioContext {
+  if (!sharedAudioCtx || sharedAudioCtx.state === 'closed') {
+    sharedAudioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
   }
-
-  // Convert AudioBuffer to WAV Blob
-  const wavBlob = audioBufferToWav(buffer);
-  const audioUrl = URL.createObjectURL(wavBlob);
-
-  return { audioUrl, duration: estimatedSeconds };
+  return sharedAudioCtx;
 }
 
-// Convert AudioBuffer to standard WAV Blob
-function audioBufferToWav(buffer: AudioBuffer): Blob {
-  const numOfChan = buffer.numberOfChannels;
-  const length = buffer.length * numOfChan * 2 + 44;
-  const out = new DataView(new ArrayBuffer(length));
-  const channels: Float32Array[] = [];
-  let offset = 0;
-  let pos = 0;
-
-  function setUint16(data: number) {
-    out.setUint16(pos, data, true);
-    pos += 2;
+export async function decodeAudioBuffer(audioUrlOrArrayBuffer: string | ArrayBuffer): Promise<AudioBuffer> {
+  const ctx = getSharedAudioContext();
+  if (ctx.state === 'suspended') {
+    await ctx.resume().catch(() => {});
   }
-  function setUint32(data: number) {
-    out.setUint32(pos, data, true);
-    pos += 4;
+  let arrayBuffer: ArrayBuffer;
+  if (typeof audioUrlOrArrayBuffer === 'string') {
+    const res = await fetch(audioUrlOrArrayBuffer);
+    arrayBuffer = await res.arrayBuffer();
+  } else {
+    arrayBuffer = audioUrlOrArrayBuffer;
   }
+  return await ctx.decodeAudioData(arrayBuffer);
+}
 
-  // RIFF identifier
-  setUint32(0x46464952); // "RIFF"
-  setUint32(length - 8); // file length - 8
-  setUint32(0x45564157); // "WAVE"
-  setUint32(0x20746d66); // "fmt "
-  setUint32(16); // subchunk1size (16 for PCM)
-  setUint16(1); // audio format (1 = PCM)
-  setUint16(numOfChan);
-  setUint32(buffer.sampleRate);
-  setUint32(buffer.sampleRate * 2 * numOfChan); // byte rate
-  setUint16(numOfChan * 2); // block align
-  setUint16(16); // bits per sample
-  setUint32(0x61746164); // "data"
-  setUint32(length - pos - 4);
-
-  for (let i = 0; i < buffer.numberOfChannels; i++) {
-    channels.push(buffer.getChannelData(i));
-  }
-
-  while (pos < length) {
-    for (let i = 0; i < numOfChan; i++) {
-      let sample = Math.max(-1, Math.min(1, channels[i][offset]));
-      sample = (0.5 + sample < 0 ? sample * 32768 : sample * 32767) | 0;
-      out.setInt16(pos, sample, true);
-      pos += 2;
-    }
-    offset++;
-  }
-
-  return new Blob([out.buffer], { type: 'audio/wav' });
+export async function getAudioDuration(audioUrl: string): Promise<number> {
+  const buffer = await decodeAudioBuffer(audioUrl);
+  return buffer.duration;
 }

@@ -18,7 +18,6 @@ import {
   generateVoiceWithGemini,
   getAudioDuration,
   parseScriptWithGemini,
-  generateBrowserSpeechFallback
 } from '../services/geminiService';
 
 interface GeneratingViewProps {
@@ -156,28 +155,19 @@ export const GeneratingView: React.FC<GeneratingViewProps> = ({
               currentProject.voiceTone
             );
             scene.audioUrl = voiceRes.audioUrl;
-            // Measure actual audio length in seconds
+            // Requisito 3: Duración de escena = max(2.5, duración de la voz + 0.3 s)
             const measuredDuration = await getAudioDuration(voiceRes.audioUrl);
-            scene.duration = Math.max(2.5, measuredDuration);
+            scene.duration = Math.max(2.5, measuredDuration + 0.3);
             scene.status = 'ready';
             await updateProjectState({ ...currentProject });
           } catch (err: any) {
-            console.warn(`Fallback de voz para escena ${i + 1}:`, err);
+            console.warn(`Error de voz en escena ${i + 1}:`, err);
             if (err?.isQuotaError) {
-              // Try browser speech synthesis fallback so user is not blocked
-              try {
-                const fallbackAudio = await generateBrowserSpeechFallback(
-                  scene.narrationText,
-                  currentProject.voiceSpeed
-                );
-                scene.audioUrl = fallbackAudio.audioUrl;
-                scene.duration = fallbackAudio.duration;
-                scene.status = 'ready';
-                await updateProjectState({ ...currentProject });
-              } catch {
-                handleQuotaExhausted(currentProject);
-                return;
-              }
+              // Requisito 1: NO marques la escena como lista: pausa el proceso, guarda el progreso, muestra el aviso de cuota
+              scene.status = 'pending';
+              await updateProjectState({ ...currentProject });
+              handleQuotaExhausted(currentProject);
+              return;
             } else {
               scene.status = 'error';
               scene.errorMessage = 'Error en la voz.';
