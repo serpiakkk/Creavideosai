@@ -128,8 +128,8 @@ export async function parseScriptWithGemini(
   // If in testMode with maxScenes, restrict blocks
   const targetBlocks = maxScenes ? blocks.slice(0, maxScenes) : blocks;
 
-  // Group into chunks of 3 to 4 blocks per call
-  const CHUNK_SIZE = 3;
+  // Group into chunks of 3 to 4 blocks per call (Requisito 9)
+  const CHUNK_SIZE = 4;
   const chunkedBlocks: ScriptBlock[][] = [];
   for (let i = 0; i < targetBlocks.length; i += CHUNK_SIZE) {
     chunkedBlocks.push(targetBlocks.slice(i, i + CHUNK_SIZE));
@@ -137,13 +137,16 @@ export async function parseScriptWithGemini(
 
   const allScenes: ParsedScene[] = [];
   let suggestedTitle = '';
-  let modelUsed = 'gemini-3.8-flash';
+  let modelUsed = 'gemini-3.1-flash-lite';
 
   for (let chunkIdx = 0; chunkIdx < chunkedBlocks.length; chunkIdx++) {
     const chunk = chunkedBlocks[chunkIdx];
-    const chunkScript = chunk
-      .map((b) => `## ${b.headerTitle}\n${b.localVisualDescription ? `IMAGEN: ${b.localVisualDescription}\n` : ''}${b.rawContent}`)
-      .join('\n\n');
+    // If it's a single block with short rawContent (e.g. an idea/topic), send raw script directly
+    const chunkScript = (chunk.length === 1 && chunk[0].rawContent.length < 150)
+      ? script
+      : chunk
+          .map((b) => `## ${b.headerTitle}\n${b.localVisualDescription ? `IMAGEN: ${b.localVisualDescription}\n` : ''}${b.rawContent}`)
+          .join('\n\n');
 
     let chunkSuccess = false;
     let attempts = 0;

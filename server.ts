@@ -13,7 +13,7 @@ const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// Helper to initialize Gemini SDK with required telemetry User-Agent
+// Helper to initialize Gemini SDK with required telemetry User-Agent and resilient timeout
 function getGeminiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
@@ -22,6 +22,7 @@ function getGeminiClient(): GoogleGenAI {
   return new GoogleGenAI({
     apiKey,
     httpOptions: {
+      timeout: 15000,
       headers: {
         'User-Agent': 'aistudio-build',
       },
@@ -224,42 +225,86 @@ Reglas obligatorias:
    - Uno de: "zoom_in", "zoom_out", "pan_left", "pan_right", "static".
 ${maxScenes ? `7. Limita la respuesta a exactamente ${maxScenes} escenas (modo prueba).` : ''}`;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: `Guion a analizar y estructurar:\n\n${script}`,
-      config: {
-        systemInstruction: systemPrompt,
-        temperature: 0.3,
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            suggestedTitle: { type: Type.STRING },
-            characterDescription: { type: Type.STRING },
-            scenes: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  title: { type: Type.STRING },
-                  narrationText: { type: Type.STRING },
-                  visualDescription: { type: Type.STRING },
-                  visualPrompt: { type: Type.STRING },
-                  estimatedDuration: { type: Type.NUMBER },
-                  cameraMotion: { type: Type.STRING },
-                  keywords: {
-                    type: Type.ARRAY,
-                    items: { type: Type.STRING },
+    // Probar primero gemini-3.1-flash-lite y luego gemini-3.8-flash
+    let response: any = null;
+    let modelUsed = 'gemini-3.1-flash-lite';
+    try {
+      response = await ai.models.generateContent({
+        model: 'gemini-3.1-flash-lite',
+        contents: `Guion o tema a estructurar:\n\n${script}`,
+        config: {
+          systemInstruction: systemPrompt,
+          temperature: 0.3,
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              suggestedTitle: { type: Type.STRING },
+              characterDescription: { type: Type.STRING },
+              scenes: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    title: { type: Type.STRING },
+                    narrationText: { type: Type.STRING },
+                    visualDescription: { type: Type.STRING },
+                    visualPrompt: { type: Type.STRING },
+                    estimatedDuration: { type: Type.NUMBER },
+                    cameraMotion: { type: Type.STRING },
+                    keywords: {
+                      type: Type.ARRAY,
+                      items: { type: Type.STRING },
+                    },
                   },
+                  required: ['title', 'narrationText', 'visualDescription', 'visualPrompt', 'estimatedDuration', 'cameraMotion'],
                 },
-                required: ['title', 'narrationText', 'visualDescription', 'visualPrompt', 'estimatedDuration', 'cameraMotion'],
               },
             },
+            required: ['suggestedTitle', 'scenes'],
           },
-          required: ['suggestedTitle', 'scenes'],
         },
-      },
-    });
+      });
+    } catch (liteErr: any) {
+      console.warn('gemini-3.1-flash-lite no disponible, intentando con gemini-3.8-flash...', liteErr?.message);
+      modelUsed = 'gemini-3.8-flash';
+      response = await ai.models.generateContent({
+        model: 'gemini-3.8-flash',
+        contents: `Guion o tema a estructurar:\n\n${script}`,
+        config: {
+          systemInstruction: systemPrompt,
+          temperature: 0.3,
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              suggestedTitle: { type: Type.STRING },
+              characterDescription: { type: Type.STRING },
+              scenes: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    title: { type: Type.STRING },
+                    narrationText: { type: Type.STRING },
+                    visualDescription: { type: Type.STRING },
+                    visualPrompt: { type: Type.STRING },
+                    estimatedDuration: { type: Type.NUMBER },
+                    cameraMotion: { type: Type.STRING },
+                    keywords: {
+                      type: Type.ARRAY,
+                      items: { type: Type.STRING },
+                    },
+                  },
+                  required: ['title', 'narrationText', 'visualDescription', 'visualPrompt', 'estimatedDuration', 'cameraMotion'],
+                },
+              },
+            },
+            required: ['suggestedTitle', 'scenes'],
+          },
+        },
+      });
+    }
 
     const parsed = cleanJsonResponse(response.text || '{}');
     const cleanedScenes = (parsed.scenes || []).map((sc: any) => ({
@@ -272,7 +317,7 @@ ${maxScenes ? `7. Limita la respuesta a exactamente ${maxScenes} escenas (modo p
       title: parsed.suggestedTitle || 'Mi Nuevo Video',
       scenes: cleanedScenes,
       characterDescription: parsed.characterDescription,
-      modelUsed: 'gemini-3.8-flash',
+      modelUsed,
     });
   } catch (error: any) {
     console.warn('Gemini script parser no disponible o cuota limitada. Activando analizador inteligente local...', error?.message);
@@ -575,6 +620,119 @@ app.post('/api/chat/command', async (req, res) => {
       return res.status(400).json({ error: 'El mensaje es requerido.' });
     }
 
+    const msgLower = userMessage.toLowerCase().trim();
+
+    // Reglas instantáneas (0ms) para los comandos más frecuentes solicitados
+    // A. Voz: "cambia la voz a Charon", "pon voz de fenrir"
+    const voiceMatch = msgLower.match(/\b(voz|narrador|locutor)\s+(?:a|de|por)?\s*(kore|puck|charon|fenrir|zephyr)\b/i) ||
+      msgLower.match(/\b(kore|puck|charon|fenrir|zephyr)\b/i);
+    if (voiceMatch) {
+      const rawName = voiceMatch[voiceMatch.length - 1].toLowerCase();
+      const capName = rawName.charAt(0).toUpperCase() + rawName.slice(1);
+      return res.json({
+        success: true,
+        understood: true,
+        actionType: 'change_voice',
+        parameters: { voiceName: capName },
+        replyMessage: `Cambié la voz del proyecto a ${capName}.`,
+      });
+    }
+
+    // B. Formato: "hazlo en formato vertical", "cambia a vertical", "9:16", "16:9", "horizontal"
+    if (msgLower.includes('vertical') || msgLower.includes('9:16') || msgLower.includes('shorts') || msgLower.includes('reels') || msgLower.includes('tiktok')) {
+      return res.json({
+        success: true,
+        understood: true,
+        actionType: 'change_aspect_ratio',
+        parameters: { aspectRatio: '9:16' },
+        replyMessage: 'Cambié el formato a vertical (9:16) optimizado para TikTok, Reels y Shorts.',
+      });
+    }
+    if (msgLower.includes('horizontal') || msgLower.includes('16:9') || msgLower.includes('panorámico') || msgLower.includes('panoramico')) {
+      return res.json({
+        success: true,
+        understood: true,
+        actionType: 'change_aspect_ratio',
+        parameters: { aspectRatio: '16:9' },
+        replyMessage: 'Cambié el formato a horizontal clásico (16:9) para YouTube.',
+      });
+    }
+
+    // C. Regenerar imagen: "rehaz la imagen de la escena 3 con un cerebro gigante"
+    const regenImgMatch = msgLower.match(/\b(?:rehaz|regenera|cambia|actualiza)\s+(?:la\s+)?imagen\s+(?:de\s+la\s+)?escena\s+(\d+)(?:\s+con\s+(.+))?/i);
+    if (regenImgMatch) {
+      const sceneNum = parseInt(regenImgMatch[1], 10);
+      const customPrompt = regenImgMatch[2]?.trim();
+      return res.json({
+        success: true,
+        understood: true,
+        actionType: 'regenerate_image',
+        parameters: {
+          sceneIndex: Math.max(0, sceneNum - 1),
+          customPrompt: customPrompt || undefined,
+        },
+        replyMessage: customPrompt
+          ? `Regenerando la imagen de la escena ${sceneNum} con: "${customPrompt}"...`
+          : `Regenerando la ilustración de la escena ${sceneNum}...`,
+      });
+    }
+
+    // D. Regenerar voz: "regenera la voz de la escena 2"
+    const regenVoiceMatch = msgLower.match(/\b(?:rehaz|regenera|actualiza)\s+(?:la\s+)?voz\s+(?:de\s+la\s+)?escena\s+(\d+)/i);
+    if (regenVoiceMatch) {
+      const sceneNum = parseInt(regenVoiceMatch[1], 10);
+      return res.json({
+        success: true,
+        understood: true,
+        actionType: 'regenerate_voice',
+        parameters: { sceneIndex: Math.max(0, sceneNum - 1) },
+        replyMessage: `Regenerando y sincronizando la voz de la escena ${sceneNum}...`,
+      });
+    }
+
+    // E. Música: "música lofi", "cambia la música a upbeat", "sin música"
+    if (msgLower.includes('sin música') || msgLower.includes('sin musica') || msgLower.includes('quitar música')) {
+      return res.json({
+        success: true,
+        understood: true,
+        actionType: 'change_music',
+        parameters: { presetType: 'none' },
+        replyMessage: 'Eliminé la pista musical de fondo del video.',
+      });
+    }
+    const musicMatch = msgLower.match(/\b(lofi|upbeat|cinematic|cinemática|cinematica|corporate|corporativo)\b/i);
+    if (musicMatch && (msgLower.includes('música') || msgLower.includes('musica') || msgLower.includes('pista') || msgLower.includes('fondo'))) {
+      let mType = musicMatch[1].toLowerCase();
+      if (mType.includes('cinemat')) mType = 'cinematic';
+      if (mType.includes('corporat')) mType = 'corporate';
+      return res.json({
+        success: true,
+        understood: true,
+        actionType: 'change_music',
+        parameters: { presetType: mType },
+        replyMessage: `Música de fondo cambiada a ${mType.toUpperCase()}.`,
+      });
+    }
+
+    // F. Estilo visual: "estilo anime", "estilo cinemático", "estilo comic"
+    const styleMatch = msgLower.match(/\b(cinematic|cinemático|cinematico|digital_art|digital|anime|comic|cómic|minimalist|minimalista)\b/i);
+    if (styleMatch && (msgLower.includes('estilo') || msgLower.includes('dibujo') || msgLower.includes('diseño'))) {
+      let sType = styleMatch[1].toLowerCase();
+      if (sType.includes('cinemat')) sType = 'cinematic';
+      else if (sType.includes('digit')) sType = 'digital_art';
+      else if (sType.includes('anim')) sType = 'anime';
+      else if (sType.includes('comic') || sType.includes('cómic')) sType = 'comic';
+      else if (sType.includes('minimal')) sType = 'minimalist';
+      return res.json({
+        success: true,
+        understood: true,
+        actionType: 'change_style',
+        parameters: { visualStyle: sType },
+        replyMessage: `Estilo visual actualizado a ${sType}.`,
+      });
+    }
+
+    // Si no coincide con reglas exactas, llamar a Gemini 3.1 Flash Lite con fallback rápido
     const ai = getGeminiClient();
     const systemPrompt = `Eres el asistente inteligente de AutoVideo IA. El usuario te da instrucciones en lenguaje natural para su video en curso.
 Debes convertir la intención del usuario en una acción ejecutable precisa o, si no estás seguro o la petición es ambigua, pedir aclaración con una pregunta directa.
@@ -596,39 +754,77 @@ Estado actual del proyecto:
 - Formato: ${currentProject?.aspectRatio || '16:9'}
 - Música: ${currentProject?.music?.presetType || 'lofi'}`;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: `Mensaje del usuario: "${userMessage}"`,
-      config: {
-        systemInstruction: systemPrompt,
-        temperature: 0.1,
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            understood: { type: Type.BOOLEAN },
-            actionType: {
-              type: Type.STRING,
-              enum: ['change_voice', 'change_aspect_ratio', 'change_style', 'change_music', 'regenerate_image', 'regenerate_voice', 'unknown']
+    let response: any = null;
+    try {
+      response = await ai.models.generateContent({
+        model: 'gemini-3.1-flash-lite',
+        contents: `Mensaje del usuario: "${userMessage}"`,
+        config: {
+          systemInstruction: systemPrompt,
+          temperature: 0.1,
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              understood: { type: Type.BOOLEAN },
+              actionType: {
+                type: Type.STRING,
+                enum: ['change_voice', 'change_aspect_ratio', 'change_style', 'change_music', 'regenerate_image', 'regenerate_voice', 'unknown']
+              },
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  voiceName: { type: Type.STRING },
+                  aspectRatio: { type: Type.STRING },
+                  visualStyle: { type: Type.STRING },
+                  presetType: { type: Type.STRING },
+                  sceneIndex: { type: Type.NUMBER },
+                  customPrompt: { type: Type.STRING },
+                  question: { type: Type.STRING },
+                }
+              },
+              replyMessage: { type: Type.STRING }
             },
-            parameters: {
-              type: Type.OBJECT,
-              properties: {
-                voiceName: { type: Type.STRING },
-                aspectRatio: { type: Type.STRING },
-                visualStyle: { type: Type.STRING },
-                presetType: { type: Type.STRING },
-                sceneIndex: { type: Type.NUMBER },
-                customPrompt: { type: Type.STRING },
-                question: { type: Type.STRING },
-              }
-            },
-            replyMessage: { type: Type.STRING }
-          },
-          required: ['understood', 'actionType', 'replyMessage']
+            required: ['understood', 'actionType', 'replyMessage']
+          }
         }
-      }
-    });
+      });
+    } catch (liteErr) {
+      console.warn('Fallo en lite para comando, probando gemini-3.8-flash...', liteErr);
+      response = await ai.models.generateContent({
+        model: 'gemini-3.8-flash',
+        contents: `Mensaje del usuario: "${userMessage}"`,
+        config: {
+          systemInstruction: systemPrompt,
+          temperature: 0.1,
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              understood: { type: Type.BOOLEAN },
+              actionType: {
+                type: Type.STRING,
+                enum: ['change_voice', 'change_aspect_ratio', 'change_style', 'change_music', 'regenerate_image', 'regenerate_voice', 'unknown']
+              },
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  voiceName: { type: Type.STRING },
+                  aspectRatio: { type: Type.STRING },
+                  visualStyle: { type: Type.STRING },
+                  presetType: { type: Type.STRING },
+                  sceneIndex: { type: Type.NUMBER },
+                  customPrompt: { type: Type.STRING },
+                  question: { type: Type.STRING },
+                }
+              },
+              replyMessage: { type: Type.STRING }
+            },
+            required: ['understood', 'actionType', 'replyMessage']
+          }
+        }
+      });
+    }
 
     const parsed = cleanJsonResponse(response.text || '{}');
     return res.json({

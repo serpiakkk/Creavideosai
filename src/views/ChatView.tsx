@@ -340,14 +340,15 @@ export const ChatView: React.FC<ChatViewProps> = ({
     setIsTyping(true);
 
     try {
-      // Check if it looks like a script submission or conversational command
-      const isScript =
-        textToSend.length > 120 ||
-        /(\d+\.|\#\#|escena|imagen:|narraci[oó]n:)/i.test(textToSend) ||
-        Boolean(attachmentInfo);
+      // Si el proyecto aún no tiene escenas, o es un archivo/guion largo, procesar como guion/idea
+      const shouldCreateScript =
+        proj.scenes.length === 0 ||
+        Boolean(attachmentInfo) ||
+        textToSend.length > 250 ||
+        /(\#\#|escena\s*\d+|n[uú]mero\s*\d+|imagen:|narraci[oó]n:)/i.test(textToSend);
 
-      if (isScript && proj.scenes.length === 0) {
-        // FLOW STEP 1: Parse script and propose setup chips
+      if (shouldCreateScript) {
+        // FLOW STEP 1: Parse script / idea y proponer chips de configuracion
         const parseResult = await parseScriptWithGemini(textToSend, proj.visualStyle);
         const estimatedMinutes = Math.max(0.5, (parseResult.scenes.length * 4.5) / 60).toFixed(1);
 
@@ -1243,8 +1244,12 @@ export const ChatView: React.FC<ChatViewProps> = ({
                             Progreso guardado. Reintentando en {quotaCountdown} s para no agotar la cuenta...
                           </p>
                           <button
-                            onClick={() => runGenerationPipeline(false)}
-                            className="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-white font-bold text-xs"
+                            onClick={() => {
+                              isCancelledRef.current = true;
+                              setQuotaCountdown(null);
+                              setTimeout(() => runGenerationPipeline(false), 50);
+                            }}
+                            className="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-white font-bold text-xs active:scale-95 transition"
                           >
                             Continuar donde me quedé
                           </button>
