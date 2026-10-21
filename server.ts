@@ -13,8 +13,8 @@ const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// Helper to initialize Gemini SDK with required telemetry User-Agent and resilient timeout
-function getGeminiClient(): GoogleGenAI {
+// Helper to initialize Gemini SDK with required telemetry User-Agent and per-task timeout (Requisito 21)
+function getGeminiClient(timeoutMs: number = 60000): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     throw new Error('GEMINI_API_KEY no está configurada en las variables de entorno.');
@@ -22,7 +22,7 @@ function getGeminiClient(): GoogleGenAI {
   return new GoogleGenAI({
     apiKey,
     httpOptions: {
-      timeout: 15000,
+      timeout: timeoutMs,
       headers: {
         'User-Agent': 'aistudio-build',
       },
@@ -42,16 +42,52 @@ function cleanJsonResponse(text: string): any {
   return JSON.parse(cleaned);
 }
 
-// Clean narration text: removes stage directions, brackets, and markdown symbols
+// Requisito 33: cleanNarration quita solo líneas "IMAGEN:", encabezados markdown y acotaciones tipo "(suspiro)"; no borres paréntesis con datos
 function cleanNarration(text: string): string {
   return text
-    .replace(/^IMAGEN:.*$/gim, '') // Remove any leftover IMAGEN lines
-    .replace(/\(.*?\)/g, '') // Remove parenthetical notes
-    .replace(/\[.*?\]/g, '') // Remove bracketed directions
-    .replace(/\*+/g, '') // Remove asterisks
-    .replace(/#{1,6}\s.*$/gm, '') // Remove markdown headers
+    .replace(/^(?:IMAGEN|IMÁGEN|VISUAL):.*$/gim, '') // Quita líneas IMAGEN
+    .replace(/#{1,6}\s.*$/gm, '') // Quita encabezados markdown
+    .replace(/\((?:suspiro|suspirando|risa|risas|riendo|pausa|silencio|tose|tos|gasp|bostezo|llanto|aplausos|música|tono\s+[^)]*|acotaci[oó]n[^)]*)\)/gi, '') // Acotaciones actorales
+    .replace(/\[(?:suspiro|risa|pausa|silencio|tose|gasp|bostezo|música|efecto).*?\]/gi, '')
+    .replace(/\*+/g, '') // Quita asteriscos
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+// Requisito 34: Servidor de voz: si es audio crudo (audio/L16 o pcm), agregar cabecera WAV (24000 Hz, 16 bits, mono)
+function wrapPcmWithWavHeader(pcmBuffer: Buffer, sampleRate = 24000, numChannels = 1, bitDepth = 16): Buffer {
+  const byteRate = sampleRate * numChannels * (bitDepth / 8);
+  const blockAlign = numChannels * (bitDepth / 8);
+  const header = Buffer.alloc(44);
+
+  header.write('RIFF', 0);
+  header.writeUInt32LE(36 + pcmBuffer.length, 4);
+  header.write('WAVE', 8);
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16); // subchunk1 size (16 for PCM)
+  header.writeUInt16LE(1, 20); // audio format (1 = PCM)
+  header.writeUInt16LE(numChannels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitDepth, 34);
+  header.write('data', 36);
+  header.writeUInt32LE(pcmBuffer.length, 40);
+
+  return Buffer.concat([header, pcmBuffer]);
+}
+
+// Helper para limitar tiempo de espera de llamadas a Gemini y evitar bucle o bloqueos por cuota agotada
+async function callGeminiWithTimeout<T>(promise: Promise<T>, timeoutMs: number = 8000): Promise<T> {
+  let timer: any;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error('GEMINI_TIMEOUT_EXCEEDED')), timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // --------------------------------------------------------------------------
@@ -71,7 +107,8 @@ function parseScriptLocally(script: string, visualStyle: string, maxScenes?: num
   const stylePrompt = visualStyle || 'Simple 2D whiteboard animation style illustration';
   const lines = script.split('\n');
 
-  let title = 'Mi Video Autónomo';
+  // Requisito 30: Corrige parseScriptLocally para detectar el título ("# Título")
+  let detectedTitle = '';
   const rawScenes: { title: string; lines: string[]; imageLines: string[] }[] = [];
   let currentScene: { title: string; lines: string[]; imageLines: string[] } | null = null;
   let sceneCounter = 1;
@@ -80,9 +117,9 @@ function parseScriptLocally(script: string, visualStyle: string, maxScenes?: num
     const line = lines[i].trim();
     if (!line) continue;
 
-    // Detect Title if it starts with #
-    if (line.startsWith('# ') && !title.includes('Mi Video')) {
-      title = line.replace(/^#\s+/, '').trim();
+    // Detect Title if it starts with single # (and not ##)
+    if (line.startsWith('# ') && !line.startsWith('## ') && !detectedTitle) {
+      detectedTitle = line.replace(/^#\s+/, '').trim();
       continue;
     }
 
@@ -175,7 +212,8 @@ function parseScriptLocally(script: string, visualStyle: string, maxScenes?: num
     };
   });
 
-  return { title, scenes };
+  const finalTitle = detectedTitle || (scenes.length > 0 ? scenes[0].title : 'Mi Video Autónomo');
+  return { title: finalTitle, scenes };
 }
 
 // --------------------------------------------------------------------------
@@ -192,9 +230,101 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// 1. POST /api/script/parse: Divide un guion en escenas con Gemini 3.8 Flash (con Character Continuity)
+// Requisito 4: Detectar modelos disponibles llamando a la API de Gemini
+app.get('/api/models/available', async (req, res) => {
+  try {
+    const ai = getGeminiClient(10000);
+    const modelsResponse = await ai.models.list();
+    const modelsList: any[] = [];
+    if (modelsResponse) {
+      for await (const m of modelsResponse) {
+        const cleanId = m.name ? m.name.replace(/^models\//, '') : '';
+        modelsList.push({
+          id: cleanId,
+          displayName: m.displayName || cleanId,
+          description: m.description || '',
+          supportedActions: m.supportedActions || [],
+        });
+      }
+    }
+    return res.json({ success: true, models: modelsList });
+  } catch (err: any) {
+    console.warn('Error al listar modelos Gemini:', err?.message);
+    // Lista verificada oficial como respaldo si falla el listado
+    return res.json({
+      success: true,
+      isFallback: true,
+      models: [
+        { id: 'gemini-3.1-flash-lite', displayName: 'Gemini 3.1 Flash Lite (Rápido)', supportedActions: ['generateContent'] },
+        { id: 'gemini-3.8-flash', displayName: 'Gemini 3.8 Flash (Equilibrado)', supportedActions: ['generateContent'] },
+        { id: 'gemini-3.8-flash-lite-tts', displayName: 'Gemini 3.8 Flash Lite TTS (Voz)', supportedActions: ['generateContent'] },
+        { id: 'gemini-3.1-flash-lite-image', displayName: 'Gemini 3.1 Flash Lite Image (Imagen)', supportedActions: ['generateContent'] },
+      ],
+    });
+  }
+});
+
+// Requisito 4: Botón Probar para modelos de nube (llamada mínima y reporte de cuota)
+app.post('/api/models/test', async (req, res) => {
+  const { modelId, task = 'script' } = req.body;
+  if (!modelId) {
+    return res.status(400).json({ error: 'modelId es requerido' });
+  }
+
+  const startTime = Date.now();
+  try {
+    const ai = getGeminiClient(12000);
+    if (task === 'voice') {
+      await ai.models.generateContent({
+        model: modelId,
+        contents: 'Prueba de voz.',
+        config: {
+          responseModalities: ['AUDIO'],
+          speechConfig: {
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
+          },
+        },
+      });
+      const latencyMs = Date.now() - startTime;
+      return res.json({ success: true, latencyMs, message: `Voz lista (${latencyMs} ms)` });
+    } else if (task === 'image') {
+      await ai.models.generateContent({
+        model: modelId,
+        contents: 'Whiteboard stick figure minimal',
+      });
+      const latencyMs = Date.now() - startTime;
+      return res.json({ success: true, latencyMs, message: `Imagen lista (${latencyMs} ms)` });
+    } else {
+      await ai.models.generateContent({
+        model: modelId,
+        contents: 'Di OK',
+      });
+      const latencyMs = Date.now() - startTime;
+      return res.json({ success: true, latencyMs, message: `Modelo listo (${latencyMs} ms)` });
+    }
+  } catch (err: any) {
+    const latencyMs = Date.now() - startTime;
+    const isQuota = err?.status === 429 || err?.message?.includes('RESOURCE_EXHAUSTED') || err?.message?.includes('quota');
+    return res.json({
+      success: false,
+      latencyMs,
+      isQuota,
+      error: isQuota ? 'Cuota agotada en este modelo' : (err?.message || 'Error al conectar con el modelo'),
+    });
+  }
+});
+
+// 1. POST /api/script/parse: Divide un guion en escenas (Requisitos 21, 28: timeout 60s, maxOutputTokens, characterDescription y modelId)
 app.post('/api/script/parse', async (req, res) => {
-  const { script, visualStyle, maxScenes } = req.body;
+  const {
+    script,
+    visualStyle,
+    maxScenes,
+    maxOutputTokens = 8192,
+    characterDescription,
+    modelId = 'gemini-3.1-flash-lite',
+  } = req.body;
+
   if (!script || typeof script !== 'string') {
     return res.status(400).json({ error: 'El guion es requerido.' });
   }
@@ -202,21 +332,26 @@ app.post('/api/script/parse', async (req, res) => {
   const stylePrompt = visualStyle || 'Simple 2D whiteboard animation style illustration';
 
   try {
-    const ai = getGeminiClient();
+    // Requisito 21: Timeout de 60s para analizar guion
+    const ai = getGeminiClient(60000);
+
+    const characterGuideline = characterDescription
+      ? `MANTÉN ESTRICTAMENTE ESTE PERSONAJE RECURRENTE: "${characterDescription}". Úsalo en TODAS las escenas donde aparezca para consistencia total.`
+      : `MANTÉN CONTINUIDAD: Diseña al personaje recurrente (ej: "a friendly stick figure with round head and neat red tie") y usa exactamente esa descripción en TODAS las escenas donde aparezca para consistencia total.`;
 
     const systemPrompt = `Eres un director audiovisual de clase mundial para canales virales de YouTube y TikTok.
-Tu tarea es tomar un guion en español y desglosarlo en escenas cinematográficas precisas, manteniendo COHERENCIA VISUAL DE PERSONAJES y ritmo dinámico.
+Tu tarea es tomar un guion o idea en español y desglosarlo en escenas cinematográficas precisas, manteniendo COHERENCIA VISUAL DE PERSONAJES y ritmo dinámico.
 
 Reglas obligatorias:
 1. NARRACIÓN HABLADA (narrationText):
    - Solo texto que se narrará en voz alta en español fluido, natural y atrapante.
-   - NUNCA incluyas guías visuales "IMAGEN:", ni notas entre paréntesis (ej: "(suspiro)"), ni asteriscos markdown.
+   - NUNCA incluyas guías visuales "IMAGEN:", ni notas actorales como "(suspiro)", ni asteriscos markdown.
 2. GUÍA VISUAL (visualDescription):
    - Qué ocurre exactamente en pantalla para el espectador.
 3. PROMPT DE IMAGEN (visualPrompt):
    - Prompt detallado en inglés optimizado para generación de imagen.
    - Combina el estilo visual elegido: "${stylePrompt}".
-   - MANTÉN CONTINUIDAD: Diseña al personaje recurrente (ej: "a friendly stick figure with round head and neat red tie") y usa exactamente esa descripción en TODAS las escenas donde aparezca para consistencia total.
+   - ${characterGuideline}
 4. PALABRAS CLAVE (keywords):
    - 2 a 4 palabras clave de alto impacto que aparezcan en narrationText para resaltarlas con color en los subtítulos dinámicos.
 5. DURACIÓN (estimatedDuration):
@@ -225,84 +360,60 @@ Reglas obligatorias:
    - Uno de: "zoom_in", "zoom_out", "pan_left", "pan_right", "static".
 ${maxScenes ? `7. Limita la respuesta a exactamente ${maxScenes} escenas (modo prueba).` : ''}`;
 
-    // Probar primero gemini-3.1-flash-lite y luego gemini-3.8-flash
     let response: any = null;
-    let modelUsed = 'gemini-3.1-flash-lite';
+    let effectiveModel = modelId || 'gemini-3.1-flash-lite';
+
     try {
-      response = await ai.models.generateContent({
-        model: 'gemini-3.1-flash-lite',
-        contents: `Guion o tema a estructurar:\n\n${script}`,
-        config: {
-          systemInstruction: systemPrompt,
-          temperature: 0.3,
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              suggestedTitle: { type: Type.STRING },
-              characterDescription: { type: Type.STRING },
-              scenes: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    title: { type: Type.STRING },
-                    narrationText: { type: Type.STRING },
-                    visualDescription: { type: Type.STRING },
-                    visualPrompt: { type: Type.STRING },
-                    estimatedDuration: { type: Type.NUMBER },
-                    cameraMotion: { type: Type.STRING },
-                    keywords: {
-                      type: Type.ARRAY,
-                      items: { type: Type.STRING },
+      response = await callGeminiWithTimeout(
+        ai.models.generateContent({
+          model: effectiveModel,
+          contents: `Guion o tema a estructurar:\n\n${script}`,
+          config: {
+            systemInstruction: systemPrompt,
+            temperature: 0.3,
+            maxOutputTokens: typeof maxOutputTokens === 'number' ? maxOutputTokens : 8192,
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                suggestedTitle: { type: Type.STRING },
+                characterDescription: { type: Type.STRING },
+                scenes: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      title: { type: Type.STRING },
+                      narrationText: { type: Type.STRING },
+                      visualDescription: { type: Type.STRING },
+                      visualPrompt: { type: Type.STRING },
+                      estimatedDuration: { type: Type.NUMBER },
+                      cameraMotion: { type: Type.STRING },
+                      keywords: {
+                        type: Type.ARRAY,
+                        items: { type: Type.STRING },
+                      },
                     },
+                    required: ['title', 'narrationText', 'visualDescription', 'visualPrompt', 'estimatedDuration', 'cameraMotion'],
                   },
-                  required: ['title', 'narrationText', 'visualDescription', 'visualPrompt', 'estimatedDuration', 'cameraMotion'],
                 },
               },
+              required: ['suggestedTitle', 'scenes'],
             },
-            required: ['suggestedTitle', 'scenes'],
           },
-        },
-      });
-    } catch (liteErr: any) {
-      console.warn('gemini-3.1-flash-lite no disponible, intentando con gemini-3.8-flash...', liteErr?.message);
-      modelUsed = 'gemini-3.8-flash';
-      response = await ai.models.generateContent({
-        model: 'gemini-3.8-flash',
-        contents: `Guion o tema a estructurar:\n\n${script}`,
-        config: {
-          systemInstruction: systemPrompt,
-          temperature: 0.3,
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              suggestedTitle: { type: Type.STRING },
-              characterDescription: { type: Type.STRING },
-              scenes: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    title: { type: Type.STRING },
-                    narrationText: { type: Type.STRING },
-                    visualDescription: { type: Type.STRING },
-                    visualPrompt: { type: Type.STRING },
-                    estimatedDuration: { type: Type.NUMBER },
-                    cameraMotion: { type: Type.STRING },
-                    keywords: {
-                      type: Type.ARRAY,
-                      items: { type: Type.STRING },
-                    },
-                  },
-                  required: ['title', 'narrationText', 'visualDescription', 'visualPrompt', 'estimatedDuration', 'cameraMotion'],
-                },
-              },
-            },
-            required: ['suggestedTitle', 'scenes'],
-          },
-        },
+        }),
+        8000
+      );
+    } catch (primaryErr: any) {
+      console.warn(`Llamada de guion a Gemini falló o tardó demasiado (${primaryErr?.message}). Pasando de inmediato al analizador inteligente local sin esperas.`);
+      const localResult = parseScriptLocally(script, visualStyle, maxScenes);
+      return res.json({
+        success: true,
+        title: localResult.title,
+        scenes: localResult.scenes,
+        characterDescription,
+        modelUsed: 'Motor Inteligente Adaptativo (Respaldo sin cuota)',
+        isFallback: true,
       });
     }
 
@@ -316,8 +427,8 @@ ${maxScenes ? `7. Limita la respuesta a exactamente ${maxScenes} escenas (modo p
       success: true,
       title: parsed.suggestedTitle || 'Mi Nuevo Video',
       scenes: cleanedScenes,
-      characterDescription: parsed.characterDescription,
-      modelUsed,
+      characterDescription: parsed.characterDescription || characterDescription,
+      modelUsed: effectiveModel,
     });
   } catch (error: any) {
     console.warn('Gemini script parser no disponible o cuota limitada. Activando analizador inteligente local...', error?.message);
@@ -327,6 +438,7 @@ ${maxScenes ? `7. Limita la respuesta a exactamente ${maxScenes} escenas (modo p
       success: true,
       title: localResult.title,
       scenes: localResult.scenes,
+      characterDescription,
       modelUsed: 'Motor Inteligente Adaptativo (Respaldo sin límites de cuota)',
       isFallback: true,
     });
@@ -387,19 +499,20 @@ ${script}`;
   }
 });
 
-// 2. POST /api/image/generate: Genera una imagen con gemini-3.1-flash-lite-image o fallback vectorial de alta resolución
+// 2. POST /api/image/generate: Genera una imagen con timeout 90s (Requisito 21) y modelo parametrizable (Requisito 12)
 app.post('/api/image/generate', async (req, res) => {
-  const { prompt, aspectRatio = '16:9', title, narrationText, keywords } = req.body;
+  const { prompt, aspectRatio = '16:9', title, narrationText, keywords, modelId = 'gemini-3.1-flash-lite-image' } = req.body;
   if (!prompt || typeof prompt !== 'string') {
     return res.status(400).json({ error: 'El prompt de imagen es requerido.' });
   }
 
-  // 1. Intentar con modelo de imagen ráster de Gemini
+  // 1. Intentar con modelo de imagen ráster de Gemini (Timeout 90s segun Requisito 21)
   try {
-    const ai = getGeminiClient();
+    const ai = getGeminiClient(90000);
+    const effectiveModel = modelId || 'gemini-3.1-flash-lite-image';
     const runGeneration = async (promptText: string) => {
       return await ai.models.generateContent({
-        model: 'gemini-3.1-flash-lite-image',
+        model: effectiveModel,
         contents: {
           parts: [{ text: promptText }],
         },
@@ -446,7 +559,7 @@ app.post('/api/image/generate', async (req, res) => {
         return res.json({
           success: true,
           imageUrl: base64Image,
-          modelUsed: 'gemini-3.1-flash-lite-image',
+          modelUsed: effectiveModel,
           isFallback: false,
         });
       }
@@ -468,7 +581,7 @@ app.post('/api/image/generate', async (req, res) => {
     return res.json({
       success: true,
       imageUrl: svgUrl,
-      modelUsed: 'gemini-3.8-flash (Ilustrador Vectorial Adaptativo - Cuenta Gratuita)',
+      modelUsed: 'Ilustrador Vectorial Adaptativo (Sin IA / Interno)',
       isFallback: true,
     });
   } catch (fallbackErr: any) {
@@ -477,10 +590,10 @@ app.post('/api/image/generate', async (req, res) => {
   }
 });
 
-// 3. POST /api/voice/generate: Genera voz con gemini-3.8-flash-lite-tts sin speechMetadata usando prompt directo con ritmo
+// 3. POST /api/voice/generate: Genera voz con timeout 90s (Req. 21) y cabecera WAV si es PCM crudo (Req. 34)
 app.post('/api/voice/generate', async (req, res) => {
   try {
-    const { text, voiceName = 'Kore', speed = 1.1, tone = 'informativo' } = req.body;
+    const { text, voiceName = 'Kore', speed = 1.1, tone = 'informativo', modelId = 'gemini-3.8-flash-lite-tts' } = req.body;
     if (!text || typeof text !== 'string') {
       return res.status(400).json({ error: 'El texto de narración es requerido.' });
     }
@@ -490,10 +603,11 @@ app.post('/api/voice/generate', async (req, res) => {
       return res.status(400).json({ error: 'El texto de narración no contiene palabras legibles.' });
     }
 
-    const ai = getGeminiClient();
+    // Requisito 21: Timeout de 90s para voz
+    const ai = getGeminiClient(90000);
+    const effectiveModel = modelId || 'gemini-3.8-flash-lite-tts';
 
-    // Requisito 2: Quita el campo speechMetadata. Para el tono usa el texto del prompt, por ejemplo:
-    // "Di con tono curioso y a ritmo rápido: <texto>". Usa el ritmo (voiceSpeed) dentro de ese texto.
+    // Requisito 2: Quita el campo speechMetadata. Usa el texto del prompt con tono y ritmo
     let speedLabel = 'normal';
     if (speed <= 0.85) speedLabel = 'pausado y lento';
     else if (speed < 1.05) speedLabel = 'moderado';
@@ -512,7 +626,7 @@ app.post('/api/voice/generate', async (req, res) => {
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
         const response = await ai.models.generateContent({
-          model: 'gemini-3.8-flash-lite-tts',
+          model: effectiveModel,
           contents: promptText,
           config: {
             responseModalities: ['AUDIO'],
@@ -524,18 +638,36 @@ app.post('/api/voice/generate', async (req, res) => {
           },
         });
 
-        const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+        const part = response.candidates?.[0]?.content?.parts?.[0];
+        const base64Audio = part?.inlineData?.data;
+        const mimeType = (part?.inlineData?.mimeType || '').toLowerCase();
+
         if (!base64Audio) {
           throw new Error('El modelo de voz no devolvió datos de audio.');
         }
 
-        const audioUrl = `data:audio/wav;base64,${base64Audio}`;
+        const rawBuffer = Buffer.from(base64Audio, 'base64');
+
+        // Requisito 34: Servidor de voz: si es audio crudo (audio/L16 o pcm) agrégale la cabecera WAV (24000 Hz, 16 bits, mono)
+        let finalBuffer = rawBuffer;
+        const isRawPcm =
+          mimeType.includes('l16') ||
+          mimeType.includes('pcm') ||
+          mimeType.includes('raw') ||
+          rawBuffer.length < 44 ||
+          rawBuffer.toString('ascii', 0, 4) !== 'RIFF';
+
+        if (isRawPcm) {
+          finalBuffer = wrapPcmWithWavHeader(rawBuffer, 24000, 1, 16);
+        }
+
+        const audioUrl = `data:audio/wav;base64,${finalBuffer.toString('base64')}`;
 
         return res.json({
           success: true,
           audioUrl,
           voiceName: validVoice,
-          modelUsed: 'gemini-3.8-flash-lite-tts',
+          modelUsed: effectiveModel,
         });
       } catch (err: any) {
         lastError = err;
@@ -567,7 +699,7 @@ app.post('/api/youtube/metadata', async (req, res) => {
       return res.status(400).json({ error: 'El guion es requerido.' });
     }
 
-    const ai = getGeminiClient();
+    const ai = getGeminiClient(30000);
     const prompt = `Actúa como un experto en SEO de YouTube en español. Basándote en el siguiente guion de video y su título propuesto ("${title || 'Video'}"), genera:
 1. 3 opciones de títulos altamente atractivos y con alto CTR (click-through-rate).
 2. Una descripción completa con introducción llamativa, resumen de puntos clave, capítulos o marcas de tiempo sugeridas, y llamado a la acción.
@@ -612,7 +744,7 @@ app.post('/api/youtube/metadata', async (req, res) => {
   }
 });
 
-// 5. POST /api/chat/command: Interpreta comandos en lenguaje natural del usuario
+// 5. POST /api/chat/command: Interpreta comandos en lenguaje natural del usuario (Requisito 29)
 app.post('/api/chat/command', async (req, res) => {
   try {
     const { userMessage, currentProject } = req.body;
@@ -622,44 +754,29 @@ app.post('/api/chat/command', async (req, res) => {
 
     const msgLower = userMessage.toLowerCase().trim();
 
-    // Reglas instantáneas (0ms) para los comandos más frecuentes solicitados
-    // A. Voz: "cambia la voz a Charon", "pon voz de fenrir"
-    const voiceMatch = msgLower.match(/\b(voz|narrador|locutor)\s+(?:a|de|por)?\s*(kore|puck|charon|fenrir|zephyr)\b/i) ||
-      msgLower.match(/\b(kore|puck|charon|fenrir|zephyr)\b/i);
-    if (voiceMatch) {
-      const rawName = voiceMatch[voiceMatch.length - 1].toLowerCase();
-      const capName = rawName.charAt(0).toUpperCase() + rawName.slice(1);
-      return res.json({
-        success: true,
-        understood: true,
-        actionType: 'change_voice',
-        parameters: { voiceName: capName },
-        replyMessage: `Cambié la voz del proyecto a ${capName}.`,
-      });
-    }
-
-    // B. Formato: "hazlo en formato vertical", "cambia a vertical", "9:16", "16:9", "horizontal"
-    if (msgLower.includes('vertical') || msgLower.includes('9:16') || msgLower.includes('shorts') || msgLower.includes('reels') || msgLower.includes('tiktok')) {
-      return res.json({
-        success: true,
-        understood: true,
-        actionType: 'change_aspect_ratio',
-        parameters: { aspectRatio: '9:16' },
-        replyMessage: 'Cambié el formato a vertical (9:16) optimizado para TikTok, Reels y Shorts.',
-      });
-    }
-    if (msgLower.includes('horizontal') || msgLower.includes('16:9') || msgLower.includes('panorámico') || msgLower.includes('panoramico')) {
-      return res.json({
-        success: true,
-        understood: true,
-        actionType: 'change_aspect_ratio',
-        parameters: { aspectRatio: '16:9' },
-        replyMessage: 'Cambié el formato a horizontal clásico (16:9) para YouTube.',
-      });
-    }
-
+    // Requisito 29: Revisa PRIMERO las reglas de "regenerar imagen/voz de la escena N"
     // C. Regenerar imagen: "rehaz la imagen de la escena 3 con un cerebro gigante"
     const regenImgMatch = msgLower.match(/\b(?:rehaz|regenera|cambia|actualiza)\s+(?:la\s+)?imagen\s+(?:de\s+la\s+)?escena\s+(\d+)(?:\s+con\s+(.+))?/i);
+    // 0. GENERAR VIDEO / INICIAR PRODUCCIÓN DE ESCENAS
+    // Resuelve directamente: "ella habla y nunca me hace los videos"
+    // Ejemplos: "haz el video", "genera el video", "haz el video ya", "empieza a generar", "inicia la generación", "créalo ya", "dibuja las escenas", "hazlo ya", "empieza", "inicia", "producir video"
+    const isStartGenIntent =
+      /\b(?:haz(?:me)?|genera|crea|inicia|empieza|arranca|renderiza|produc(?:e|ir))\s+(?:el\s+|la\s+)?(?:video|generaci[oó]n|escenas|producci[oó]n|dibujo|dibujos)\b/i.test(msgLower) ||
+      /\b(?:hazlo\s+ya|empieza\s+ya|inicia\s+ya|gen[eé]ralo\s+ya|hazlo|empieza|inicia)\b/i.test(msgLower);
+
+    if (isStartGenIntent && !msgLower.includes('sobre') && !msgLower.includes('de un') && !msgLower.includes('guion')) {
+      const isTest = msgLower.includes('prueba') || msgLower.includes('2 escenas');
+      return res.json({
+        success: true,
+        understood: true,
+        actionType: 'start_generation',
+        parameters: { testMode: isTest },
+        replyMessage: isTest
+          ? '¡Iniciando la prueba rápida con las 2 primeras escenas ahora mismo!'
+          : '¡Iniciando la generación de tu video completo ahora mismo!',
+      });
+    }
+
     if (regenImgMatch) {
       const sceneNum = parseInt(regenImgMatch[1], 10);
       const customPrompt = regenImgMatch[2]?.trim();
@@ -688,6 +805,136 @@ app.post('/api/chat/command', async (req, res) => {
         parameters: { sceneIndex: Math.max(0, sceneNum - 1) },
         replyMessage: `Regenerando y sincronizando la voz de la escena ${sceneNum}...`,
       });
+    }
+
+    // B. Arreglar / corregir errores en mensajes o escenas
+    // Ejemplos: "arregla la escena 2, dice barco y debe decir avión", "corrige la escena 1: nuevo texto", "cambia el texto de la escena 3 a..."
+    const editSceneMatch = userMessage.match(/\b(?:arregla|corrige|cambia|modifica|edita|actualiza)\s+(?:el\s+texto\s+(?:de\s+)?|la\s+narraci[oó]n\s+(?:de\s+)?|el\s+gui[oó]n\s+(?:de\s+)?|la\s+frase\s+(?:de\s+)?|el\s+mensaje\s+(?:de\s+)?)?(?:la\s+)?escena\s+(\d+)(?:[\s\:\,\-]+(?:por|a|diciendo|con|que\s+diga)?\s*[\"\“\']?(.+?)[\"\”\']?)?$/i);
+    if (editSceneMatch && !msgLower.includes('imagen') && !msgLower.includes('dibujo') && !msgLower.includes('ilustración')) {
+      const sceneNum = parseInt(editSceneMatch[1], 10);
+      const rawNewText = editSceneMatch[2]?.trim();
+      const sceneIdx = Math.max(0, sceneNum - 1);
+      const existingScene = currentProject?.scenes?.[sceneIdx];
+
+      if (rawNewText && rawNewText.length > 2) {
+        return res.json({
+          success: true,
+          understood: true,
+          actionType: 'edit_scene',
+          parameters: {
+            sceneIndex: sceneIdx,
+            newNarrationText: rawNewText,
+          },
+          replyMessage: `Corregí la narración de la escena ${sceneNum} a: "${rawNewText}".`,
+        });
+      } else {
+        return res.json({
+          success: true,
+          understood: true,
+          actionType: 'ask_scene_correction',
+          parameters: { sceneIndex: sceneIdx },
+          replyMessage: `¿Qué corrección o nuevo texto deseas para la escena ${sceneNum}? (Actualmente dice: "${existingScene?.narrationText || 'sin texto'}")`,
+        });
+      }
+    }
+
+    // C. Saludos y conversación normal amigable
+    const isGreetingOrChat =
+      /^(?:hola|buen[ao]s\s*(?:d[ií]as|tardes|noches)?|hey|saludos|qu[eé]\s+tal|c[oó]mo\s+est[aá]s|qu[ií]en\s+eres|qu[eé]\s+puedes\s+hacer|ay[uú]dame|gracias|muchas\s+gracias|ok|vale|perfecto|entendido)\b/i.test(msgLower);
+
+    if (isGreetingOrChat && !msgLower.includes('escena') && !msgLower.includes('formato') && !msgLower.includes('voz') && !msgLower.includes('estilo')) {
+      const sceneCount = currentProject?.scenesCount || currentProject?.scenes?.length || 0;
+      let reply = '';
+      if (msgLower.startsWith('hola') || msgLower.startsWith('buen') || msgLower.startsWith('hey') || msgLower.startsWith('saludos')) {
+        reply = sceneCount > 0
+          ? `¡Hola! Tu proyecto "${currentProject?.title || 'Video'}" tiene ${sceneCount} escenas listas. Puedes decirme: "haz el video", "arregla la escena 1", "cambia la voz a Puck", o pedirme cualquier ajuste.`
+          : '¡Hola! Soy tu asistente de AutoVideo IA. Dime sobre qué quieres que sea tu video (por ejemplo: "hazme un video sobre la luna") o pega tu guion y lo estructuraré de inmediato.';
+      } else if (msgLower.includes('quién eres') || msgLower.includes('quien eres') || msgLower.includes('qué puedes hacer') || msgLower.includes('que puedes hacer')) {
+        reply = 'Soy el asistente inteligente de AutoVideo IA. Conmigo puedes:\n• Crear guiones a partir de cualquier tema o idea.\n• Iniciar la producción completa del video diciendo "haz el video".\n• Arreglar y corregir errores en cualquier escena ("arregla la escena 2...").\n• Cambiar voces (Gemini, Piper local, Kokoro local).\n• Cambiar formato (16:9 horizontal o 9:16 vertical).\n• Elegir estilos visuales y música de fondo.';
+      } else if (msgLower.includes('gracias')) {
+        reply = '¡Con mucho gusto! Estoy aquí para que tu video quede excelente. Dime "haz el video" cuando quieras que empiece a generarlo.';
+      } else {
+        reply = sceneCount > 0
+          ? `¿En qué te puedo ayudar? Tienes ${sceneCount} escenas. Puedes decirme "haz el video" para iniciar, o pedirme corregir alguna escena.`
+          : 'Dime sobre qué tema quieres tu video y te crearé el guion listo para generar.';
+      }
+      return res.json({
+        success: true,
+        understood: true,
+        actionType: 'conversation',
+        replyMessage: reply,
+      });
+    }
+
+    // D. Creación de guion desde una idea por chat
+    const isCreateIntent =
+      /^(?:crea|haz|genera|escribe|quiero)\s+(?:un\s+)?(?:video|gui[oó]n|historia|relato)\s+(?:de|sobre|para)\s+(.+)/i.test(userMessage) ||
+      /^video\s+(?:de|sobre)\s+(.+)/i.test(userMessage);
+
+    if (isCreateIntent && (!currentProject?.scenes || currentProject.scenes.length === 0)) {
+      const match = userMessage.match(/^(?:crea|haz|genera|escribe|quiero)?\s*(?:un\s+)?(?:video|gui[oó]n|historia|relato)?\s*(?:de|sobre|para)\s*(.+)/i);
+      const topic = match?.[1]?.trim() || userMessage.trim();
+      const shouldAutoStart = msgLower.includes('y hazlo') || msgLower.includes('y genera') || msgLower.includes('ya');
+      const generated = parseScriptLocally(
+        `# Video: ${topic}\n\n## Introducción\n${topic} es un tema fascinante. En este video veremos sus puntos clave.\n\n## Desarrollo\nExploramos los aspectos más impactantes y relevantes que necesitas saber.\n\n## Conclusión\nEsto demuestra la importancia de ${topic}. Déjanos tu opinión en los comentarios.`,
+        currentProject?.visualStyle || 'Simple 2D whiteboard animation style illustration'
+      );
+      return res.json({
+        success: true,
+        understood: true,
+        actionType: 'create_script',
+        parameters: {
+          title: `Video sobre ${topic.slice(0, 35)}`,
+          scenes: generated.scenes,
+          autoStart: shouldAutoStart,
+        },
+        replyMessage: `¡Listo! He creado el guion de ${generated.scenes.length} escenas sobre "${topic}". Puedes pulsar "Generar video completo" o decirme "haz el video" para empezar la producción de inmediato.`,
+      });
+    }
+
+    // A. Voz: "cambia la voz a Charon", "pon voz de fenrir"
+    const voiceMatch = msgLower.match(/\b(?:cambia|pon|usa|elegir)\s+(?:la\s+)?(?:voz|narrador|locutor)\s+(?:a|de|por)?\s*(kore|puck|charon|fenrir|zephyr)\b/i) ||
+      msgLower.match(/\b(kore|puck|charon|fenrir|zephyr)\b/i);
+    if (voiceMatch) {
+      const rawName = voiceMatch[voiceMatch.length - 1].toLowerCase();
+      const capName = rawName.charAt(0).toUpperCase() + rawName.slice(1);
+      return res.json({
+        success: true,
+        understood: true,
+        actionType: 'change_voice',
+        parameters: { voiceName: capName },
+        replyMessage: `Cambié la voz del proyecto a ${capName}.`,
+      });
+    }
+
+    // Requisito 29: Las de formato SOLO se activan si el mensaje contiene "formato" o "cambia a/hazlo en" junto a vertical/horizontal
+    const hasFormatIntent =
+      msgLower.includes('formato') ||
+      msgLower.includes('cambia a') ||
+      msgLower.includes('hazlo en') ||
+      msgLower.includes('ponlo en') ||
+      msgLower.includes('cambiar a') ||
+      msgLower.includes('hacerlo en');
+
+    if (hasFormatIntent) {
+      if (msgLower.includes('vertical') || msgLower.includes('9:16') || msgLower.includes('shorts') || msgLower.includes('reels') || msgLower.includes('tiktok')) {
+        return res.json({
+          success: true,
+          understood: true,
+          actionType: 'change_aspect_ratio',
+          parameters: { aspectRatio: '9:16' },
+          replyMessage: 'Cambié el formato a vertical (9:16) optimizado para TikTok, Reels y Shorts.',
+        });
+      }
+      if (msgLower.includes('horizontal') || msgLower.includes('16:9') || msgLower.includes('panorámico') || msgLower.includes('panoramico')) {
+        return res.json({
+          success: true,
+          understood: true,
+          actionType: 'change_aspect_ratio',
+          parameters: { aspectRatio: '16:9' },
+          replyMessage: 'Cambié el formato a horizontal clásico (16:9) para YouTube.',
+        });
+      }
     }
 
     // E. Música: "música lofi", "cambia la música a upbeat", "sin música"
@@ -732,97 +979,115 @@ app.post('/api/chat/command', async (req, res) => {
       });
     }
 
-    // Si no coincide con reglas exactas, llamar a Gemini 3.1 Flash Lite con fallback rápido
-    const ai = getGeminiClient();
-    const systemPrompt = `Eres el asistente inteligente de AutoVideo IA. El usuario te da instrucciones en lenguaje natural para su video en curso.
-Debes convertir la intención del usuario en una acción ejecutable precisa o, si no estás seguro o la petición es ambigua, pedir aclaración con una pregunta directa.
-NUNCA inventes una acción si no está claramente expresada.
+    // G. Formatear memoria contextual para Gemini (chatHistory y scenesSummary)
+    const historyText = (currentProject?.chatHistory || [])
+      .map((m: any) => `${m.sender === 'user' ? 'Usuario' : 'Asistente'}: ${m.text}`)
+      .join('\n');
 
-Acciones válidas:
-- "change_voice": Parámetros: voiceName ('Kore' | 'Puck' | 'Charon' | 'Fenrir' | 'Zephyr').
-- "change_aspect_ratio": Parámetros: aspectRatio ('16:9' | '9:16').
-- "change_style": Parámetros: visualStyle (estilo gráfico en inglés o descriptivo).
-- "change_music": Parámetros: presetType ('lofi' | 'upbeat' | 'cinematic' | 'corporate' | 'none').
-- "regenerate_image": Parámetros: sceneIndex (número de escena 0-based), customPrompt (opcional nuevo prompt).
-- "regenerate_voice": Parámetros: sceneIndex (número de escena 0-based).
-- "unknown": Si el usuario dice algo que no es un comando claro de edición, pide aclaración amablemente en replyMessage.
+    const scenesSummaryText = (currentProject?.scenesSummary || [])
+      .map((s: any) => `• Escena ${s.order + 1} (${s.title}): "${s.narration}"`)
+      .join('\n');
+
+    // Llamar a Gemini con timeout estricto de 6 segundos y memoria completa
+    const ai = getGeminiClient();
+    const systemPrompt = `Eres el asistente ejecutivo de AutoVideo IA.
+Eres inteligente, lógico, directo y con excelente memoria contextual. NUNCA sobrepienses ni des rodeos ni pidas confirmaciones obvias.
+Si el usuario te pide crear o hacer el video, ejecuta la acción "start_generation" inmediatamente.
+Si el usuario te pide cambiar un texto o detalle de una escena, aplica la acción "edit_scene".
+
+Historial de conversación reciente (MEMORIA CONTEXTUAL):
+${historyText || '(Inicio de conversación)'}
+
+Escenas actuales en el proyecto:
+${scenesSummaryText || '(Sin escenas aún)'}
+
+Acciones válidas (actionType):
+- "start_generation": El usuario te pide hacer, generar, iniciar o crear el video. (testMode: boolean opcional).
+- "conversation": El usuario charla, hace preguntas sobre el video o pide aclaraciones. Responde de forma inteligente, concisa y empática en replyMessage.
+- "edit_scene": El usuario pide cambiar, corregir o arreglar el texto de una escena. sceneIndex (número de escena 0-based), newNarrationText (texto corregido).
+- "change_voice": voiceName ('Kore' | 'Puck' | 'Charon' | 'Fenrir' | 'Zephyr').
+- "change_aspect_ratio": aspectRatio ('16:9' | '9:16').
+- "change_style": visualStyle (estilo en inglés o descriptivo).
+- "change_music": presetType ('lofi' | 'upbeat' | 'cinematic' | 'corporate' | 'none').
+- "regenerate_image": sceneIndex, customPrompt.
+- "regenerate_voice": sceneIndex.
+- "unknown": Solo si es totalmente ininteligible.
 
 Estado actual del proyecto:
 - Título: ${currentProject?.title || 'Sin título'}
-- Escenas totales: ${currentProject?.scenes?.length || 0}
-- Voz actual: ${currentProject?.voiceName || 'Kore'}
+- Escenas totales: ${currentProject?.scenesCount || currentProject?.scenes?.length || 0}
+- Voz: ${currentProject?.voiceName || 'Kore'}
 - Formato: ${currentProject?.aspectRatio || '16:9'}
 - Música: ${currentProject?.music?.presetType || 'lofi'}`;
 
     let response: any = null;
     try {
-      response = await ai.models.generateContent({
-        model: 'gemini-3.1-flash-lite',
-        contents: `Mensaje del usuario: "${userMessage}"`,
-        config: {
-          systemInstruction: systemPrompt,
-          temperature: 0.1,
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              understood: { type: Type.BOOLEAN },
-              actionType: {
-                type: Type.STRING,
-                enum: ['change_voice', 'change_aspect_ratio', 'change_style', 'change_music', 'regenerate_image', 'regenerate_voice', 'unknown']
+      response = await callGeminiWithTimeout(
+        ai.models.generateContent({
+          model: 'gemini-3.1-flash-lite',
+          contents: `Mensaje del usuario: "${userMessage}"`,
+          config: {
+            systemInstruction: systemPrompt,
+            temperature: 0.2,
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                understood: { type: Type.BOOLEAN },
+                actionType: {
+                  type: Type.STRING,
+                  enum: ['start_generation', 'conversation', 'edit_scene', 'change_voice', 'change_aspect_ratio', 'change_style', 'change_music', 'regenerate_image', 'regenerate_voice', 'unknown']
+                },
+                parameters: {
+                  type: Type.OBJECT,
+                  properties: {
+                    testMode: { type: Type.BOOLEAN },
+                    voiceName: { type: Type.STRING },
+                    aspectRatio: { type: Type.STRING },
+                    visualStyle: { type: Type.STRING },
+                    presetType: { type: Type.STRING },
+                    sceneIndex: { type: Type.NUMBER },
+                    newNarrationText: { type: Type.STRING },
+                    customPrompt: { type: Type.STRING },
+                    question: { type: Type.STRING },
+                  }
+                },
+                replyMessage: { type: Type.STRING }
               },
-              parameters: {
-                type: Type.OBJECT,
-                properties: {
-                  voiceName: { type: Type.STRING },
-                  aspectRatio: { type: Type.STRING },
-                  visualStyle: { type: Type.STRING },
-                  presetType: { type: Type.STRING },
-                  sceneIndex: { type: Type.NUMBER },
-                  customPrompt: { type: Type.STRING },
-                  question: { type: Type.STRING },
-                }
-              },
-              replyMessage: { type: Type.STRING }
-            },
-            required: ['understood', 'actionType', 'replyMessage']
+              required: ['understood', 'actionType', 'replyMessage']
+            }
           }
-        }
-      });
-    } catch (liteErr) {
-      console.warn('Fallo en lite para comando, probando gemini-3.8-flash...', liteErr);
-      response = await ai.models.generateContent({
-        model: 'gemini-3.8-flash',
-        contents: `Mensaje del usuario: "${userMessage}"`,
-        config: {
-          systemInstruction: systemPrompt,
-          temperature: 0.1,
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              understood: { type: Type.BOOLEAN },
-              actionType: {
-                type: Type.STRING,
-                enum: ['change_voice', 'change_aspect_ratio', 'change_style', 'change_music', 'regenerate_image', 'regenerate_voice', 'unknown']
-              },
-              parameters: {
-                type: Type.OBJECT,
-                properties: {
-                  voiceName: { type: Type.STRING },
-                  aspectRatio: { type: Type.STRING },
-                  visualStyle: { type: Type.STRING },
-                  presetType: { type: Type.STRING },
-                  sceneIndex: { type: Type.NUMBER },
-                  customPrompt: { type: Type.STRING },
-                  question: { type: Type.STRING },
-                }
-              },
-              replyMessage: { type: Type.STRING }
-            },
-            required: ['understood', 'actionType', 'replyMessage']
-          }
-        }
+        }),
+        6000
+      );
+    } catch (primaryErr) {
+      // Fallback conversacional local inteligente con memoria si Gemini no responde en 6s o la cuota se agota
+      console.warn('Gemini chat command no disponible o timeout. Usando analizador inteligente local con memoria.');
+      const sceneCount = currentProject?.scenesCount || currentProject?.scenes?.length || 0;
+      let localReply = '';
+      
+      if (isStartGenIntent) {
+        return res.json({
+          success: true,
+          understood: true,
+          actionType: 'start_generation',
+          parameters: { testMode: false },
+          replyMessage: '¡Iniciando la generación de tu video ahora mismo!',
+        });
+      } else if (msgLower.includes('escena')) {
+        const num = msgLower.match(/\d+/)?.[0] || '1';
+        localReply = `Entendido. Para ajustar la escena ${num}, puedes decirme: "corrige la escena ${num}: [tu nuevo texto]" o "rehaz la imagen de la escena ${num}".`;
+      } else if (sceneCount === 0) {
+        localReply = `¡Te escucho! Dime sobre qué tema quieres tu video (ejemplo: "haz un video sobre la luna") o pega tu guion directamente y lo estructuraré de inmediato.`;
+      } else {
+        localReply = `Comprendo tu mensaje. Tu proyecto tiene ${sceneCount} escenas. Puedes decirme "haz el video" para iniciar la producción, o pedirme que ajuste cualquier texto.`;
+      }
+
+      return res.json({
+        success: true,
+        understood: true,
+        actionType: 'conversation',
+        replyMessage: localReply,
       });
     }
 

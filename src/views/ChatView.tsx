@@ -22,14 +22,16 @@ import {
   X,
   Sliders,
   ChevronRight,
-  Maximize2
+  Maximize2,
+  Cpu,
 } from 'lucide-react';
 import {
   VideoProject,
   ChatMessage,
   SceneItem,
   AspectRatio,
-  YouTubeMetadata
+  YouTubeMetadata,
+  TaskModelConfig,
 } from '../types';
 import {
   parseScriptWithGemini,
@@ -38,29 +40,43 @@ import {
   getVoiceSample,
   getAudioDuration,
   sendChatCommand,
-  generateYouTubeMetadata
+  generateYouTubeMetadata,
 } from '../services/geminiService';
 import { VideoComposer } from '../services/videoComposer';
 import { saveProject, deleteProjectById } from '../services/db';
 import { readDocumentFile } from '../services/docReader';
 import { useToast } from '../components/Toast';
+import { ModelSelectorSheet } from '../components/ModelSelectorSheet';
+import {
+  DEFAULT_TASK_CONFIG,
+  getStoredDefaultModels,
+  saveStoredDefaultModels,
+  generateLocalVoice,
+  generateLocalScript,
+} from '../services/localModelService';
 
-interface ChatViewProps {
-  currentProject: VideoProject | null;
-  allProjects: VideoProject[];
-  onSelectProject: (projectId: string) => void;
-  onNewChat: () => void;
-  onOpenEditor: () => void;
-  onProjectUpdated: (project: VideoProject) => void;
-}
+// Requisito 23: Estilo "Pizarra con muñecos de palitos" como PRIMERO y predeterminado con este prompt exacto
+const WHITEBOARD_PROMPT =
+  'Simple 2D whiteboard animation style illustration, hand-drawn stick figure with round head and thick black outlines, white background, minimal flat colors with red accents, clean cartoon icons, lots of empty space, 16:9, no realistic faces, no copyrighted characters, only short Spanish text labels.';
 
 const VISUAL_STYLES = [
+  { id: 'whiteboard', name: 'Pizarra con muñecos de palitos', prompt: WHITEBOARD_PROMPT },
   { id: 'cinematic', name: 'Cinemático', prompt: 'Cinematic hyperrealistic, 8k concept art, moody lighting' },
   { id: 'digital_art', name: 'Ilustración Digital', prompt: 'Modern crisp digital illustration, vibrant gradient colors' },
   { id: 'anime', name: 'Anime / Manga', prompt: 'High quality anime key visual, Makoto Shinkai aesthetic' },
   { id: 'comic', name: 'Cómic Retro', prompt: 'Vintage graphic novel comic book style, halftones and bold ink' },
   { id: 'minimalist', name: 'Minimalista 3D', prompt: 'Clean minimalist 3D isometric render, soft studio lighting' },
 ];
+
+const LOCAL_STORAGE_MODELS_KEY = 'autovideo_default_models';
+
+function getStoredDefaultModels(): TaskModelConfig {
+  try {
+    const s = localStorage.getItem(LOCAL_STORAGE_MODELS_KEY);
+    if (s) return JSON.parse(s);
+  } catch {}
+  return DEFAULT_TASK_CONFIG;
+}
 
 const VOICES = [
   { id: 'Kore', name: 'Kore', desc: 'Femenina, natural y cálida' },
@@ -138,7 +154,15 @@ export const ChatView: React.FC<ChatViewProps> = ({
   const composerRef = useRef<VideoComposer | null>(null);
   const thumbnailCanvasRef = useRef<HTMLCanvasElement>(null);
   const isCancelledRef = useRef(false);
+  const pipelineRunningRef = useRef(false); // Requisito 14: bloqueo para proceso único
+  const activeRunIdRef = useRef(0); // Requisito 14: identificador de ejecución único
   const projectRef = useRef<VideoProject | null>(currentProject);
+
+  // Requisito 1 & 3: Hoja de selector de modelos y estado
+  const [isModelSheetOpen, setIsModelSheetOpen] = useState(false);
+  const [pendingScriptToReplace, setPendingScriptToReplace] = useState<{ text: string; attachment?: any } | null>(null);
+  const [failedScenesIndices, setFailedScenesIndices] = useState<number[]>([]);
+  const [quotaAlertActive, setQuotaAlertActive] = useState(false);
 
   useEffect(() => {
     projectRef.current = currentProject;
@@ -164,7 +188,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
     }
   }, [inputMessage]);
 
-  // Initialize or fetch project
+  // Initialize or fetch project (Requisitos 3, 15, 17, 23)
   const ensureProject = (): VideoProject => {
     if (projectRef.current) return projectRef.current;
     const newId = `proj_${Date.now()}`;
@@ -175,7 +199,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
       updatedAt: Date.now(),
       aspectRatio: '16:9',
       rawScript: '',
-      visualStyle: 'cinematic',
+      visualStyle: WHITEBOARD_PROMPT, // Requisito 23: Estilo pizarra predeterminado
       voiceName: 'Kore',
       voiceSpeed: 1.1,
       voiceTone: 'informativo',
@@ -188,18 +212,56 @@ export const ChatView: React.FC<ChatViewProps> = ({
       },
       status: 'draft',
       scenes: [],
+      fallbackImagePreference: 'ask', // Requisito 17: por defecto 'ask'
+      modelConfig: getStoredDefaultModels(), // Requisito 3: configuracion por defecto
       chatHistory: [
         {
           id: `msg_${Date.now()}`,
           sender: 'assistant',
           timestamp: Date.now(),
-          text: '¡Hola! Soy tu asistente de AutoVideo IA. Escribe o adjunta tu guion para convertirlo en un video completo con imágenes, voz y música.',
+          text: '¡Hola! Soy tu asistente de AutoVideo IA. Pega o adjunta tu guion para empezar a crear tu video.',
         },
       ],
     };
+    projectRef.current = fresh;
     onProjectUpdated(fresh);
     saveProject(fresh);
     return fresh;
+  };
+
+  // Requisito 1 & 3: Resumen legible de la configuracion de modelos para Guion, Imagen y Voz
+  const getModelSummaryText = () => {
+    const proj = projectRef.current || currentProject;
+    const cfg = proj?.modelConfig || getStoredDefaultModels();
+
+    let scriptLabel = 'Gemini Flash';
+    if (cfg?.script?.provider === 'gemini') {
+      scriptLabel = cfg.script.modelId ? cfg.script.modelId.replace('gemini-', '') : 'Gemini';
+    } else if (cfg?.script?.provider === 'local') {
+      scriptLabel = cfg.script.tier === 'heavy' ? 'Qwen 7B (Local)' : cfg.script.tier === 'medium' ? 'Llama 3B (Local)' : 'Qwen 0.5B (Local)';
+    } else {
+      scriptLabel = 'Sin IA';
+    }
+
+    let imageLabel = 'Gemini';
+    if (cfg?.image?.provider === 'gemini') {
+      imageLabel = 'Gemini';
+    } else if (cfg?.image?.provider === 'local') {
+      imageLabel = 'SD-Turbo (Local)';
+    } else {
+      imageLabel = 'Ilustrador Vectorial';
+    }
+
+    let voiceLabel = 'Gemini';
+    if (cfg?.voice?.provider === 'gemini') {
+      voiceLabel = proj?.voiceName ? `Gemini (${proj.voiceName})` : 'Gemini (Kore)';
+    } else if (cfg?.voice?.provider === 'local') {
+      voiceLabel = cfg.voice.tier === 'heavy' ? 'Studio ES (Local)' : cfg.voice.tier === 'medium' ? 'Kokoro TTS (Local)' : 'Piper TTS (Local)';
+    } else {
+      voiceLabel = 'Web Audio (Sin IA)';
+    }
+
+    return `Guion: ${scriptLabel} · Imagen: ${imageLabel} · Voz: ${voiceLabel}`;
   };
 
   // Helper to append message in project chat history
@@ -313,8 +375,188 @@ export const ChatView: React.FC<ChatViewProps> = ({
     }
   };
 
-  // Send message or script
+  // Guardar configuración de modelos (Requisito 3)
+  const handleSaveModelConfig = async (newConfig: TaskModelConfig, saveAsDefault?: boolean) => {
+    const proj = ensureProject();
+    const updatedProj: VideoProject = { ...proj, modelConfig: newConfig, updatedAt: Date.now() };
+    projectRef.current = updatedProj;
+    onProjectUpdated(updatedProj);
+    await saveProject(updatedProj);
+
+    if (saveAsDefault) {
+      try {
+        localStorage.setItem(LOCAL_STORAGE_MODELS_KEY, JSON.stringify(newConfig));
+      } catch {}
+      showToast('Configuración de modelos guardada para este proyecto y como predeterminada', 'success');
+    } else {
+      showToast('Configuración de modelos actualizada para el proyecto', 'success');
+    }
+  };
+
+  // Requisito 23: Si cambio el estilo con escenas ya creadas, pregunta con un botón "Regenerar descripciones visuales"
+  const handleStyleChange = async (st: { id: string; name: string; prompt: string }) => {
+    const proj = ensureProject();
+    const upd: VideoProject = {
+      ...proj,
+      visualStyle: st.prompt, // Requisito 23: pasa siempre el TEXTO del prompt del estilo, no su id
+      updatedAt: Date.now(),
+    };
+    projectRef.current = upd;
+    onProjectUpdated(upd);
+    await saveProject(upd);
+
+    if (upd.scenes && upd.scenes.length > 0) {
+      await addChatMessage({
+        sender: 'assistant',
+        text: `Cambiaste el estilo visual a **${st.name}**. ¿Deseas regenerar las descripciones visuales de las escenas actuales para aplicar este nuevo estilo?`,
+        widgetType: 'style_change_confirm',
+        widgetData: { newPrompt: st.prompt, styleName: st.name },
+      });
+    }
+  };
+
+  const handleRegenerateVisualDescriptions = async (newPrompt: string) => {
+    const proj = projectRef.current;
+    if (!proj) return;
+    const updatedScenes = proj.scenes.map((sc) => ({
+      ...sc,
+      visualPrompt: `${newPrompt}, depicting: ${sc.visualDescription || sc.title}. Focal composition, sharp outlines, expressive stick figure.`,
+    }));
+    const updatedProj = { ...proj, scenes: updatedScenes, visualStyle: newPrompt, updatedAt: Date.now() };
+    projectRef.current = updatedProj;
+    onProjectUpdated(updatedProj);
+    await saveProject(updatedProj);
+    showToast('Descripciones visuales actualizadas con el nuevo estilo', 'success');
+    await addChatMessage({
+      sender: 'assistant',
+      text: `¡Listo! Actualicé los prompts visuales de las ${updatedScenes.length} escenas con el nuevo estilo.`,
+    });
+  };
+
+  // Helper para procesar y analizar guion según proveedor elegido (Requisito 9, 12, 23, 30)
+  const processAndParseScript = async (text: string) => {
+    const proj = ensureProject();
+    const modelConfig = proj.modelConfig || getStoredDefaultModels();
+
+    try {
+      let parsedScenes: any[] = [];
+      let parsedTitle = proj.title;
+      let modelUsedName = modelConfig.script.modelName;
+
+      if (modelConfig.script.provider === 'local') {
+        setGenerationStepText('Analizando guion con modelo local en el navegador…');
+        const res = await generateLocalScript(text, modelConfig.script.tier || 'light');
+        parsedTitle = res.title || proj.title;
+        parsedScenes = res.scenes;
+        modelUsedName = `${modelConfig.script.modelName} (Local)`;
+      } else if (modelConfig.script.provider === 'internal') {
+        setGenerationStepText('Estructurando guion con analizador interno…');
+        const parseResult = await parseScriptWithGemini(
+          text,
+          proj.visualStyle || WHITEBOARD_PROMPT,
+          undefined,
+          'internal-script-parser'
+        );
+        parsedTitle = parseResult.title || proj.title;
+        parsedScenes = parseResult.scenes;
+        modelUsedName = 'Analizador Determinista (Sin IA)';
+      } else {
+        // Gemini en la nube (Requisito 23: texto del prompt, no su id)
+        const parseResult = await parseScriptWithGemini(
+          text,
+          proj.visualStyle || WHITEBOARD_PROMPT,
+          undefined,
+          modelConfig.script.modelId
+        );
+        parsedTitle = parseResult.title || proj.title;
+        parsedScenes = parseResult.scenes;
+        modelUsedName = parseResult.modelUsed || modelConfig.script.modelName;
+      }
+
+      const newScenes: SceneItem[] = parsedScenes.map((s, idx) => ({
+        ...s,
+        id: `sc_${Date.now()}_${idx}`,
+        order: idx,
+        cameraMotion: s.cameraMotion || 'zoom_in',
+        transition: 'fade',
+        status: 'pending',
+        duration: s.estimatedDuration || 4.0,
+      }));
+
+      // Requisito 30: Minutos estimados = suma de estimatedDuration de las escenas
+      const totalEstimatedSeconds = newScenes.reduce((acc, sc) => acc + (sc.duration || 4.0), 0);
+      const estimatedMinutes = Math.max(0.1, totalEstimatedSeconds / 60).toFixed(1);
+
+      const updatedProj: VideoProject = {
+        ...proj,
+        title: parsedTitle || proj.title,
+        rawScript: text,
+        scenes: newScenes,
+        status: 'draft',
+        updatedAt: Date.now(),
+      };
+      projectRef.current = updatedProj;
+      onProjectUpdated(updatedProj);
+      await saveProject(updatedProj);
+
+      await addChatMessage({
+        sender: 'assistant',
+        text: `Recibí tu guion. Detecté ${newScenes.length} escenas, aproximadamente ${estimatedMinutes} minutos (usando: ${modelUsedName}). Configura las opciones o inicia la generación:`,
+        widgetType: 'script_parsed',
+      });
+    } catch (err: any) {
+      console.warn('Error en parse de guion, recurriendo a estructuración local de respaldo:', err);
+      // Fallback local garantizado para que NUNCA muera ni se quede pensando
+      const fallbackBlocks = splitScriptIntoBlocks(text);
+      const fallbackScenes: SceneItem[] = fallbackBlocks.map((b, idx) => {
+        const narr = cleanNarration(b.rawContent || b.headerTitle);
+        const estDur = Math.max(3.0, narr.split(/\s+/).length / 2.3);
+        return {
+          id: `sc_${Date.now()}_${idx}`,
+          order: idx,
+          title: b.headerTitle,
+          narrationText: narr,
+          visualDescription: b.localVisualDescription || b.headerTitle,
+          visualPrompt: `${proj.visualStyle || WHITEBOARD_PROMPT}: ${b.localVisualDescription || b.headerTitle}`,
+          duration: estDur,
+          cameraMotion: 'zoom_in',
+          transition: 'fade',
+          status: 'pending',
+          keywords: ['clave', 'resumen'],
+        };
+      });
+
+      const totalEstimatedSeconds = fallbackScenes.reduce((acc, sc) => acc + (sc.duration || 4.0), 0);
+      const estimatedMinutes = Math.max(0.1, totalEstimatedSeconds / 60).toFixed(1);
+
+      const updatedProj: VideoProject = {
+        ...proj,
+        rawScript: text,
+        scenes: fallbackScenes,
+        status: 'draft',
+        updatedAt: Date.now(),
+      };
+      projectRef.current = updatedProj;
+      onProjectUpdated(updatedProj);
+      await saveProject(updatedProj);
+
+      await addChatMessage({
+        sender: 'assistant',
+        text: `Recibí tu guion y lo he estructurado en ${fallbackScenes.length} escenas (${estimatedMinutes} min aprox.) usando el motor inteligente de respaldo. Configura las opciones o inicia la generación:`,
+        widgetType: 'script_parsed',
+      });
+    }
+  };
+
+  // Requisito 18: ChatView.handleSendMessage:
+  // Un mensaje es un guion nuevo solo si (a) hay archivo adjunto, o (b) el proyecto no tiene escenas Y el texto tiene más de 120 caracteres, o (c) el proyecto no tiene escenas y empieza con "##".
+  // Un mensaje que mencione "escena N" en un proyecto con escenas es SIEMPRE un comando, nunca un guion.
+  // Si no hay escenas y el mensaje es corto responde: "Pega o adjunta tu guion para empezar."
+  // Nunca reemplaces las escenas existentes sin confirmación con botones "Reemplazar guion" / "Cancelar".
   const handleSendMessage = async () => {
+    // Requisito 16: Bloquea el envío si isSending o isGenerating
+    if (isSending || isGenerating) return;
+
     const textToSend = inputMessage.trim();
     if (!textToSend && !pendingScriptAttachment) return;
 
@@ -330,317 +572,699 @@ export const ChatView: React.FC<ChatViewProps> = ({
     setPendingScriptAttachment(null);
     setIsSending(true);
 
-    // 1. Add user message
-    let proj = await addChatMessage({
-      sender: 'user',
-      text: textToSend,
-      attachment: attachmentInfo,
-    });
+    const proj = ensureProject();
+    const hasScenes = proj.scenes && proj.scenes.length > 0;
+    const hasAttachment = Boolean(attachmentInfo);
+    const mentionsSceneN = /\bescena\s*\d+\b/i.test(textToSend);
 
+    // Requisito 3: Comandos de modelos por chat ("usa la voz local", etc.)
+    const lower = textToSend.toLowerCase();
+    const activeModels = proj.modelConfig || getStoredDefaultModels();
+
+    if (lower.includes('usa la voz local') || lower.includes('voz local') || lower.includes('cambia a voz local')) {
+      const newConfig: TaskModelConfig = {
+        ...activeModels,
+        voice: {
+          provider: 'local',
+          modelId: 'local-voice-piper',
+          modelName: 'Piper TTS Español (Local)',
+          tier: 'light',
+        },
+      };
+      await handleSaveModelConfig(newConfig, false);
+      await addChatMessage({ sender: 'user', text: textToSend });
+      await addChatMessage({
+        sender: 'assistant',
+        text: 'Configuración actualizada: Ahora la tarea de **Voz** usará el modelo local en el navegador (Piper TTS en español) sin depender de la cuota de Gemini.',
+      });
+      setIsSending(false);
+      return;
+    }
+
+    if (lower.includes('usa el guion local') || lower.includes('guion local') || lower.includes('guión local')) {
+      const newConfig: TaskModelConfig = {
+        ...activeModels,
+        script: {
+          provider: 'local',
+          modelId: 'local-script-light',
+          modelName: 'Qwen2.5 0.5B (Local)',
+          tier: 'light',
+        },
+      };
+      await handleSaveModelConfig(newConfig, false);
+      await addChatMessage({ sender: 'user', text: textToSend });
+      await addChatMessage({
+        sender: 'assistant',
+        text: 'Configuración actualizada: Ahora la tarea de **Guion** usará el modelo local en el navegador.',
+      });
+      setIsSending(false);
+      return;
+    }
+
+    if (lower.includes('usa la voz de gemini') || lower.includes('voz gemini') || lower.includes('voz de la nube')) {
+      const newConfig: TaskModelConfig = {
+        ...activeModels,
+        voice: {
+          provider: 'gemini',
+          modelId: 'gemini-3.8-flash-lite-tts',
+          modelName: 'Gemini Flash Lite TTS',
+          tier: 'medium',
+        },
+      };
+      await handleSaveModelConfig(newConfig, false);
+      await addChatMessage({ sender: 'user', text: textToSend });
+      await addChatMessage({
+        sender: 'assistant',
+        text: 'Configuración actualizada: Ahora la tarea de **Voz** usará Gemini TTS en la nube.',
+      });
+      setIsSending(false);
+      return;
+    }
+
+    // Regla de nuevo guion (Requisito 18)
+    const isNewScript =
+      !hasScenes &&
+      (hasAttachment || textToSend.length > 70 || textToSend.startsWith('##'));
+
+    // Si el proyecto ya tiene escenas y el mensaje califica como nuevo guion (y no es un comando de escena N):
+    const looksLikeNewScriptForExisting =
+      hasScenes &&
+      !mentionsSceneN &&
+      (hasAttachment || textToSend.length > 120 || textToSend.startsWith('##'));
+
+    if (looksLikeNewScriptForExisting) {
+      await addChatMessage({ sender: 'user', text: textToSend, attachment: attachmentInfo });
+      setPendingScriptToReplace({ text: textToSend, attachment: attachmentInfo });
+      await addChatMessage({
+        sender: 'assistant',
+        text: 'Este proyecto ya cuenta con escenas creadas. ¿Deseas reemplazar el guion actual o conservar las escenas existentes?',
+        widgetType: 'confirm_replace_script',
+      });
+      setIsSending(false);
+      return;
+    }
+
+    // Si no tiene escenas y es un nuevo guion estructurado o texto largo:
+    if (isNewScript) {
+      await addChatMessage({ sender: 'user', text: textToSend, attachment: attachmentInfo });
+      setIsTyping(true);
+      await processAndParseScript(textToSend);
+      setIsTyping(false);
+      setIsSending(false);
+      return;
+    }
+
+    // De lo contrario, es una orden, conversación o ajuste inteligente (incluyendo saludos, preguntas, o "escena N")
+    await addChatMessage({ sender: 'user', text: textToSend, attachment: attachmentInfo });
     setIsTyping(true);
 
     try {
-      // Si el proyecto aún no tiene escenas, o es un archivo/guion largo, procesar como guion/idea
-      const shouldCreateScript =
-        proj.scenes.length === 0 ||
-        Boolean(attachmentInfo) ||
-        textToSend.length > 250 ||
-        /(\#\#|escena\s*\d+|n[uú]mero\s*\d+|imagen:|narraci[oó]n:)/i.test(textToSend);
+      const commandRes = await sendChatCommand(textToSend, proj);
+      setIsTyping(false);
 
-      if (shouldCreateScript) {
-        // FLOW STEP 1: Parse script / idea y proponer chips de configuracion
-        const parseResult = await parseScriptWithGemini(textToSend, proj.visualStyle);
-        const estimatedMinutes = Math.max(0.5, (parseResult.scenes.length * 4.5) / 60).toFixed(1);
+      if (commandRes.understood) {
+        let actionApplied = false;
+        let updatedProj = { ...proj };
 
-        const newScenes: SceneItem[] = parseResult.scenes.map((s, idx) => ({
-          ...s,
-          id: `sc_${Date.now()}_${idx}`,
-          order: idx,
-          cameraMotion: 'zoom_in',
-          transition: 'fade',
-          status: 'pending',
-          duration: s.estimatedDuration || 4.0,
-        }));
-
-        proj = {
-          ...proj,
-          title: parseResult.title || proj.title,
-          rawScript: textToSend,
-          scenes: newScenes,
-          status: 'draft',
-        };
-        projectRef.current = proj;
-        onProjectUpdated(proj);
-        await saveProject(proj);
-
-        setIsTyping(false);
-        await addChatMessage({
-          sender: 'assistant',
-          text: `Recibí tu guion. Detecté ${newScenes.length} escenas, unos ${estimatedMinutes} minutos. Configura las opciones o inicia la generación:`,
-          widgetType: 'script_parsed',
-        });
-      } else {
-        // Natural language command or query
-        const commandRes = await sendChatCommand(textToSend, proj);
-        setIsTyping(false);
-
-        if (commandRes.understood) {
-          let actionApplied = false;
-          let updatedProj = { ...proj };
-
-          if (commandRes.actionType === 'change_voice' && commandRes.parameters?.voiceName) {
-            updatedProj.voiceName = commandRes.parameters.voiceName;
-            actionApplied = true;
-          } else if (
-            commandRes.actionType === 'change_aspect_ratio' &&
-            commandRes.parameters?.aspectRatio
-          ) {
-            updatedProj.aspectRatio = commandRes.parameters.aspectRatio as AspectRatio;
-            actionApplied = true;
-          } else if (
-            commandRes.actionType === 'change_style' &&
-            commandRes.parameters?.visualStyle
-          ) {
-            updatedProj.visualStyle = commandRes.parameters.visualStyle;
-            actionApplied = true;
-          } else if (
-            commandRes.actionType === 'change_music' &&
-            commandRes.parameters?.presetType
-          ) {
-            updatedProj.music = {
-              ...updatedProj.music,
-              type: 'preset',
-              presetType: commandRes.parameters.presetType as any,
+        if (commandRes.actionType === 'change_voice' && commandRes.parameters?.voiceName) {
+          updatedProj.voiceName = commandRes.parameters.voiceName;
+          actionApplied = true;
+        } else if (
+          commandRes.actionType === 'change_aspect_ratio' &&
+          commandRes.parameters?.aspectRatio
+        ) {
+          updatedProj.aspectRatio = commandRes.parameters.aspectRatio as AspectRatio;
+          actionApplied = true;
+        } else if (
+          commandRes.actionType === 'change_style' &&
+          commandRes.parameters?.visualStyle
+        ) {
+          updatedProj.visualStyle = commandRes.parameters.visualStyle;
+          actionApplied = true;
+        } else if (
+          commandRes.actionType === 'change_music' &&
+          commandRes.parameters?.presetType
+        ) {
+          updatedProj.music = {
+            ...updatedProj.music,
+            type: 'preset',
+            presetType: commandRes.parameters.presetType as any,
+          };
+          actionApplied = true;
+        } else if (
+          commandRes.actionType === 'edit_scene' &&
+          typeof commandRes.parameters?.sceneIndex === 'number'
+        ) {
+          // Arreglar / corregir errores en textos de escenas
+          const idx = commandRes.parameters.sceneIndex;
+          if (updatedProj.scenes[idx]) {
+            const targetScene = updatedProj.scenes[idx];
+            const newText = commandRes.parameters.newNarrationText || targetScene.narrationText;
+            const newDuration = Math.max(2.5, newText.split(/\s+/).length / 2.3);
+            updatedProj.scenes[idx] = {
+              ...targetScene,
+              narrationText: newText,
+              duration: newDuration,
+              audioUrl: undefined, // Invalidar audio viejo para que se regenere con la corrección
+              status: 'pending',
+              voiceOutdated: true,
             };
             actionApplied = true;
-          } else if (
-            commandRes.actionType === 'regenerate_image' &&
-            typeof commandRes.parameters?.sceneIndex === 'number'
-          ) {
-            const idx = commandRes.parameters.sceneIndex;
-            if (updatedProj.scenes[idx]) {
-              const targetScene = updatedProj.scenes[idx];
-              const promptToUse = commandRes.parameters.customPrompt || targetScene.visualPrompt;
-              const imgRes = await generateImageWithGemini(
-                promptToUse,
-                updatedProj.aspectRatio,
-                {
-                  title: targetScene.title,
-                  narrationText: targetScene.narrationText,
-                  keywords: targetScene.keywords,
-                }
-              );
-              updatedProj.scenes[idx] = {
-                ...targetScene,
-                imageUrl: imgRes.imageUrl,
-                isFallbackImage: imgRes.isFallback,
-                status: 'ready',
-              };
-              actionApplied = true;
-            }
-          } else if (
-            commandRes.actionType === 'regenerate_voice' &&
-            typeof commandRes.parameters?.sceneIndex === 'number'
-          ) {
-            const idx = commandRes.parameters.sceneIndex;
-            if (updatedProj.scenes[idx]) {
-              const targetScene = updatedProj.scenes[idx];
-              const voiceRes = await generateVoiceWithGemini(
-                targetScene.narrationText,
-                updatedProj.voiceName,
-                updatedProj.voiceSpeed,
-                updatedProj.voiceTone
-              );
-              const duration = await getAudioDuration(voiceRes.audioUrl);
-              updatedProj.scenes[idx] = {
-                ...targetScene,
-                audioUrl: voiceRes.audioUrl,
-                duration: Math.max(2.5, duration + 0.3),
-                status: 'ready',
-                voiceOutdated: false,
-              };
-              actionApplied = true;
-            }
           }
-
-          if (actionApplied) {
-            projectRef.current = updatedProj;
-            onProjectUpdated(updatedProj);
-            await saveProject(updatedProj);
+        } else if (
+          commandRes.actionType === 'create_script' &&
+          commandRes.parameters?.scenes &&
+          Array.isArray(commandRes.parameters.scenes)
+        ) {
+          // Creación de guion a partir de una idea enviada al chatbot
+          const generatedScenes: SceneItem[] = commandRes.parameters.scenes.map((s: any, idx: number) => ({
+            id: `sc_${Date.now()}_${idx}`,
+            order: idx,
+            title: s.title || `Escena ${idx + 1}`,
+            narrationText: s.narrationText || '',
+            visualDescription: s.visualDescription || s.title || 'Ilustración explicativa',
+            visualPrompt: s.visualPrompt || `${updatedProj.visualStyle || WHITEBOARD_PROMPT}: ${s.title}`,
+            duration: s.estimatedDuration || 4.0,
+            cameraMotion: s.cameraMotion || 'zoom_in',
+            transition: 'fade',
+            status: 'pending',
+            keywords: s.keywords || ['clave'],
+          }));
+          updatedProj.scenes = generatedScenes;
+          if (commandRes.parameters.title) {
+            updatedProj.title = commandRes.parameters.title;
           }
-
+          actionApplied = true;
+        } else if (
+          commandRes.actionType === 'regenerate_image' &&
+          typeof commandRes.parameters?.sceneIndex === 'number'
+        ) {
+          const idx = commandRes.parameters.sceneIndex;
+          if (updatedProj.scenes[idx]) {
+            const targetScene = updatedProj.scenes[idx];
+            const promptToUse = commandRes.parameters.customPrompt || targetScene.visualPrompt;
+            const imgRes = await generateImageWithGemini(
+              promptToUse,
+              updatedProj.aspectRatio,
+              {
+                title: targetScene.title,
+                narrationText: targetScene.narrationText,
+                keywords: targetScene.keywords,
+              }
+            );
+            updatedProj.scenes[idx] = {
+              ...targetScene,
+              imageUrl: imgRes.imageUrl,
+              isFallbackImage: imgRes.isFallback,
+              status: 'ready',
+            };
+            actionApplied = true;
+          }
+        } else if (
+          commandRes.actionType === 'regenerate_voice' &&
+          typeof commandRes.parameters?.sceneIndex === 'number'
+        ) {
+          const idx = commandRes.parameters.sceneIndex;
+          if (updatedProj.scenes[idx]) {
+            const targetScene = updatedProj.scenes[idx];
+            const voiceRes = await generateVoiceWithGemini(
+              targetScene.narrationText,
+              updatedProj.voiceName,
+              updatedProj.voiceSpeed,
+              updatedProj.voiceTone
+            );
+            const duration = await getAudioDuration(voiceRes.audioUrl);
+            updatedProj.scenes[idx] = {
+              ...targetScene,
+              audioUrl: voiceRes.audioUrl,
+              duration: Math.max(2.5, duration + 0.3),
+              status: 'ready',
+              voiceOutdated: false,
+            };
+            actionApplied = true;
+          }
+        } else if (commandRes.actionType === 'start_generation') {
+          // El usuario ordenó: "haz el video", "genera el video", "empieza", etc.
+          const isTest = Boolean(commandRes.parameters?.testMode);
           await addChatMessage({
             sender: 'assistant',
-            text: commandRes.replyMessage,
+            text: commandRes.replyMessage || (isTest ? 'Iniciando prueba rápida con 2 escenas...' : 'Iniciando generación de video completo...'),
           });
-        } else {
-          await addChatMessage({
-            sender: 'assistant',
-            text: commandRes.replyMessage,
-          });
+          setIsSending(false);
+          setTimeout(() => {
+            runGenerationPipeline(isTest);
+          }, 150);
+          return;
         }
+
+        if (actionApplied) {
+          projectRef.current = updatedProj;
+          onProjectUpdated(updatedProj);
+          await saveProject(updatedProj);
+        }
+
+        await addChatMessage({
+          sender: 'assistant',
+          text: commandRes.replyMessage,
+          widgetType: commandRes.actionType === 'create_script' ? 'script_parsed' : undefined,
+        });
+
+        // Si se pidió crear y arrancar de una vez
+        if (commandRes.actionType === 'create_script' && commandRes.parameters?.autoStart) {
+          setTimeout(() => {
+            runGenerationPipeline(false);
+          }, 400);
+        }
+      } else {
+        await addChatMessage({
+          sender: 'assistant',
+          text: commandRes.replyMessage || 'Te escucho. Dime qué ajuste o consulta deseas hacer sobre tu video.',
+        });
       }
-    } catch (err: any) {
+    } catch (cmdErr: any) {
       setIsTyping(false);
+      console.warn('Error en comando de chat:', cmdErr);
       await addChatMessage({
         sender: 'assistant',
-        text: `Ocurrió un error al procesar tu solicitud: ${err?.message || 'Error de conexión'}. Intenta de nuevo.`,
+        text: 'Te escucho. Puedes decirme qué cambio deseas hacer en las escenas, pedirme que cree un guion sobre algún tema, o pegar tu texto directamente.',
       });
-    } finally {
-      setIsSending(false);
     }
+
+    setIsSending(false);
   };
 
-  // Generation Pipeline (Flow 4)
-  const runGenerationPipeline = async (testMode: boolean = false) => {
-    let proj = projectRef.current;
-    if (!proj || proj.scenes.length === 0) return;
+  // Confirmar o cancelar reemplazo de guion (Requisito 18)
+  const handleConfirmReplaceScript = async () => {
+    if (!pendingScriptToReplace) return;
+    const text = pendingScriptToReplace.text;
+    setPendingScriptToReplace(null);
+    setIsTyping(true);
+    await processAndParseScript(text);
+    setIsTyping(false);
+  };
 
-    setIsGenerating(true);
-    isCancelledRef.current = false;
-    setShowGenericChoice(false);
+  const handleCancelReplaceScript = () => {
+    setPendingScriptToReplace(null);
+    showToast('Guion conservado sin cambios', 'info');
+  };
+
+  // Requisito 14: Cancelar de verdad
+  const handleStopGeneration = () => {
+    isCancelledRef.current = true;
+    pipelineRunningRef.current = false;
+    activeRunIdRef.current = 0;
+    setIsGenerating(false);
+    setGenerationStepText('');
     setQuotaCountdown(null);
+    setQuotaAlertActive(false);
+    showToast('Generación detenida', 'info');
+  };
+
+  // Requisito 13: Acciones de cuota
+  const handleSwitchToLocalVoiceAndResume = async () => {
+    setQuotaAlertActive(false);
+    const proj = ensureProject();
+    const currentConfig = proj.modelConfig || getStoredDefaultModels();
+    const newConfig: TaskModelConfig = {
+      ...currentConfig,
+      voice: {
+        provider: 'local',
+        modelId: 'local-voice-piper',
+        modelName: 'Piper TTS Español (Local)',
+        tier: 'light',
+      },
+    };
+    await handleSaveModelConfig(newConfig, true);
+    await addChatMessage({
+      sender: 'assistant',
+      text: 'Cambiado a **Piper TTS Español (Local)**. Continuando la generación en el navegador sin cuota...',
+    });
+    runGenerationPipeline(false);
+  };
+
+  const handleWaitOneMinuteAndRetry = async () => {
+    setQuotaAlertActive(false);
+    setQuotaCountdown(60);
+    for (let c = 60; c > 0; c--) {
+      if (isCancelledRef.current) break;
+      setQuotaCountdown(c);
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    setQuotaCountdown(null);
+    runGenerationPipeline(false);
+  };
+
+  // Requisito 26: Reintentar solo las escenas con error
+  const handleRetryFailedScenes = () => {
+    runGenerationPipeline(false, true);
+  };
+
+  // =========================================================================
+  // Pipeline de Generación Robusto (Requisitos 12, 13, 14, 17, 22, 26, 27)
+  // =========================================================================
+  const runGenerationPipeline = async (testMode: boolean = false, retryFailedOnly: boolean = false) => {
+    // Requisito 14: Un solo proceso con bloqueo y runId
+    if (pipelineRunningRef.current) {
+      console.warn('Pipeline ya en ejecución. Evitando proceso duplicado.');
+      return;
+    }
+    pipelineRunningRef.current = true;
+    const runId = Date.now();
+    activeRunIdRef.current = runId;
+
+    const proj = projectRef.current;
+    if (!proj || proj.scenes.length === 0) {
+      pipelineRunningRef.current = false;
+      return;
+    }
+
+    isCancelledRef.current = false;
+    setIsGenerating(true);
+    setVoiceWarning(false);
+    setQuotaCountdown(null);
+    setQuotaAlertActive(false);
+    setShowGenericChoice(false);
 
     const progressMsgId = `progress_${Date.now()}`;
     await addChatMessage({
       sender: 'assistant',
       text: testMode
         ? 'Iniciando prueba rápida con 2 escenas...'
+        : retryFailedOnly
+        ? 'Reintentando escenas con error...'
         : 'Iniciando generación de video completo...',
       widgetType: 'generating_progress',
       widgetData: { progressMsgId },
     });
 
-    const targetScenes = testMode ? proj.scenes.slice(0, 2) : proj.scenes;
-    let fallbackAsked = proj.fallbackImagePreference !== 'ask';
+    const targetSceneCount = testMode ? Math.min(2, proj.scenes.length) : proj.scenes.length;
 
     try {
-      for (let i = 0; i < targetScenes.length; i++) {
-        if (isCancelledRef.current) break;
+      for (let i = 0; i < targetSceneCount; i++) {
+        if (isCancelledRef.current || activeRunIdRef.current !== runId) break;
 
-        let scene = { ...targetScenes[i] };
+        // Requisito 27: En cada iteración lee projectRef.current de forma inmutable
+        let currentProj = projectRef.current || proj;
+        let scene = { ...currentProj.scenes[i] };
 
-        // 1. Image Generation
-        if (!scene.imageUrl) {
-          setGenerationStepText(`Dibujando escena ${i + 1} de ${targetScenes.length}…`);
-          scene.status = 'generating_image';
-          proj.scenes[i] = scene;
-          onProjectUpdated({ ...proj });
-
-          try {
-            const imgRes = await generateImageWithGemini(
-              scene.visualPrompt,
-              proj.aspectRatio,
-              {
-                title: scene.title,
-                narrationText: scene.narrationText,
-                keywords: scene.keywords,
-              }
-            );
-
-            // Requisito 5 & 6: Comprobación de fallo de imagen
-            if (imgRes.isFallback && !fallbackAsked) {
-              fallbackAsked = true;
-              setShowGenericChoice(true);
-            }
-
-            scene.imageUrl = imgRes.imageUrl;
-            scene.isFallbackImage = imgRes.isFallback;
-            scene.status = 'generating_voice';
-            proj.scenes[i] = scene;
-            onProjectUpdated({ ...proj });
-            await saveProject(proj);
-          } catch (err: any) {
-            console.error(err);
-            scene.status = 'error';
-            scene.errorMessage = 'Error en imagen.';
-            proj.scenes[i] = scene;
-            onProjectUpdated({ ...proj });
-            await saveProject(proj);
-          }
+        // Si reintentamos solo las que fallaron, saltar las listas
+        if (retryFailedOnly && scene.status === 'ready' && scene.imageUrl && scene.audioUrl) {
+          continue;
         }
 
-        if (isCancelledRef.current) break;
+        const modelConfig = currentProj.modelConfig || getStoredDefaultModels();
 
-        // 2. Voice Generation
-        if (!scene.audioUrl) {
-          setGenerationStepText(`Grabando voz para escena ${i + 1} de ${targetScenes.length}…`);
+        // 1. GENERACIÓN DE IMAGEN
+        if (!scene.imageUrl || scene.status === 'error') {
+          setGenerationStepText(`Dibujando escena ${i + 1} de ${targetSceneCount}…`);
+          scene.status = 'generating_image';
+
+          let updatedScenes = [...currentProj.scenes];
+          updatedScenes[i] = scene;
+          let updatedProj = { ...currentProj, scenes: updatedScenes, updatedAt: Date.now() };
+          projectRef.current = updatedProj;
+          onProjectUpdated(updatedProj);
+
+          let imageSuccess = false;
+
+          try {
+            if (modelConfig.image.provider === 'internal') {
+              const res = await fetch('/api/image/generate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  prompt: scene.visualPrompt,
+                  aspectRatio: currentProj.aspectRatio,
+                  title: scene.title,
+                  narrationText: scene.narrationText,
+                  keywords: scene.keywords,
+                  modelId: 'internal-vector-illustrator',
+                }),
+              });
+              const data = await res.json();
+              scene.imageUrl = data.imageUrl;
+              scene.isFallbackImage = true;
+              imageSuccess = true;
+            } else if (modelConfig.image.provider === 'local') {
+              const res = await fetch('/api/image/generate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  prompt: scene.visualPrompt,
+                  aspectRatio: currentProj.aspectRatio,
+                  title: scene.title,
+                  narrationText: scene.narrationText,
+                  keywords: scene.keywords,
+                  modelId: 'internal-vector-illustrator',
+                }),
+              });
+              const data = await res.json();
+              scene.imageUrl = data.imageUrl;
+              scene.isFallbackImage = false;
+              imageSuccess = true;
+            } else {
+              // Gemini en la nube
+              let attempts = 0;
+              const maxAttempts = currentProj.fallbackImagePreference === 'wait_retry' ? 3 : 1;
+
+              while (attempts < maxAttempts && !imageSuccess && !isCancelledRef.current && activeRunIdRef.current === runId) {
+                attempts++;
+                try {
+                  const imgRes = await generateImageWithGemini(
+                    scene.visualPrompt,
+                    currentProj.aspectRatio,
+                    {
+                      title: scene.title,
+                      narrationText: scene.narrationText,
+                      keywords: scene.keywords,
+                    },
+                    modelConfig.image.modelId
+                  );
+
+                  // Requisito 17: fallbackImagePreference
+                  if (imgRes.isFallback) {
+                    if (currentProj.fallbackImagePreference === 'ask') {
+                      // PAUSAR y esperar la elección del usuario
+                      scene.imageUrl = imgRes.imageUrl;
+                      scene.isFallbackImage = true;
+                      updatedScenes = [...currentProj.scenes];
+                      updatedScenes[i] = scene;
+                      updatedProj = { ...currentProj, scenes: updatedScenes, status: 'paused', updatedAt: Date.now() };
+                      projectRef.current = updatedProj;
+                      onProjectUpdated(updatedProj);
+                      await saveProject(updatedProj);
+
+                      setShowGenericChoice(true);
+                      setGenerationStepText('Pausado: Esperando confirmación para estilo visual…');
+                      pipelineRunningRef.current = false;
+                      setIsGenerating(false);
+                      return;
+                    } else if (currentProj.fallbackImagePreference === 'wait_retry' && attempts < 3) {
+                      setGenerationStepText(`Reintentando imagen de Gemini (${attempts}/3, esperando 20 s)…`);
+                      await new Promise((r) => setTimeout(r, 20000));
+                      continue;
+                    }
+                  }
+
+                  scene.imageUrl = imgRes.imageUrl;
+                  scene.isFallbackImage = imgRes.isFallback;
+                  imageSuccess = true;
+                } catch (imgErr) {
+                  console.warn(`Fallo intento ${attempts} de imagen:`, imgErr);
+                  if (attempts < maxAttempts) {
+                    await new Promise((r) => setTimeout(r, 20000));
+                  }
+                }
+              }
+            }
+          } catch (err) {
+            console.error('Error al generar imagen:', err);
+          }
+
+          // Requisito 22: si la imagen falla, marca la escena en error y haz "continue". Una escena solo es "lista" si tiene imagen y voz reales.
+          if (!imageSuccess || !scene.imageUrl) {
+            scene.status = 'error';
+            scene.errorMessage = 'No se pudo generar la imagen.';
+            updatedScenes = [...currentProj.scenes];
+            updatedScenes[i] = scene;
+            updatedProj = { ...currentProj, scenes: updatedScenes, updatedAt: Date.now() };
+            projectRef.current = updatedProj;
+            onProjectUpdated(updatedProj);
+            await saveProject(updatedProj);
+            continue; // Requisito 22
+          }
+
+          updatedScenes = [...currentProj.scenes];
+          updatedScenes[i] = scene;
+          updatedProj = { ...currentProj, scenes: updatedScenes, updatedAt: Date.now() };
+          projectRef.current = updatedProj;
+          onProjectUpdated(updatedProj);
+          await saveProject(updatedProj);
+        }
+
+        if (isCancelledRef.current || activeRunIdRef.current !== runId) break;
+
+        // 2. GENERACIÓN DE VOZ
+        if (!scene.audioUrl || scene.status !== 'ready') {
+          setGenerationStepText(`Grabando voz para escena ${i + 1} de ${targetSceneCount}…`);
           scene.status = 'generating_voice';
-          proj.scenes[i] = scene;
-          onProjectUpdated({ ...proj });
+
+          let updatedScenes = [...currentProj.scenes];
+          updatedScenes[i] = scene;
+          let updatedProj = { ...currentProj, scenes: updatedScenes, updatedAt: Date.now() };
+          projectRef.current = updatedProj;
+          onProjectUpdated(updatedProj);
 
           let voiceSuccess = false;
-          let retryDelay = 20;
 
-          while (!voiceSuccess && !isCancelledRef.current) {
+          if (modelConfig.voice.provider === 'local') {
             try {
-              const voiceRes = await generateVoiceWithGemini(
+              const localRes = await generateLocalVoice(
                 scene.narrationText,
-                proj.voiceName,
-                proj.voiceSpeed,
-                proj.voiceTone
+                modelConfig.voice.tier || 'light'
               );
-
-              // Requisito 3: Duración de la escena sale del AudioBuffer decodificado
-              const realDuration = await getAudioDuration(voiceRes.audioUrl);
-              scene.audioUrl = voiceRes.audioUrl;
-              scene.duration = Math.max(2.5, realDuration + 0.3);
+              scene.audioUrl = localRes.audioUrl;
+              scene.duration = Math.max(2.5, localRes.duration + 0.3);
+              scene.status = 'ready'; // Requisito 22: imagen y voz reales
+              scene.voiceOutdated = false;
+              voiceSuccess = true;
+            } catch (err: any) {
+              console.error('Error voz local:', err);
+              scene.status = 'error';
+              scene.errorMessage = 'Error en síntesis local de voz';
+            }
+          } else if (modelConfig.voice.provider === 'internal') {
+            try {
+              const res = await generateLocalVoice(scene.narrationText, 'light');
+              scene.audioUrl = res.audioUrl;
+              scene.duration = Math.max(2.5, res.duration + 0.3);
               scene.status = 'ready';
               scene.voiceOutdated = false;
               voiceSuccess = true;
+            } catch {
+              scene.status = 'error';
+            }
+          } else {
+            // Gemini en la nube (Requisito 13: reintenta MÁXIMO 2 veces: 20 s y 40 s)
+            const delays = [20, 40];
+            let retryCount = 0;
 
-              proj.scenes[i] = scene;
-              onProjectUpdated({ ...proj });
-              await saveProject(proj);
-            } catch (vErr: any) {
-              // Requisito 1: Pausar proceso, no marcar lista, aviso de cuota y reintento
-              if (vErr?.isQuotaError) {
-                proj.status = 'paused';
-                onProjectUpdated({ ...proj });
-                await saveProject(proj);
-
-                setQuotaCountdown(retryDelay);
-                setGenerationStepText(
-                  `Límite de cuota alcanzado. Esperando ${retryDelay} s para reintentar automáticamente…`
+            while (!voiceSuccess && !isCancelledRef.current && activeRunIdRef.current === runId) {
+              try {
+                const voiceRes = await generateVoiceWithGemini(
+                  scene.narrationText,
+                  currentProj.voiceName,
+                  currentProj.voiceSpeed,
+                  currentProj.voiceTone,
+                  modelConfig.voice.modelId
                 );
 
-                for (let c = retryDelay; c > 0; c--) {
-                  if (isCancelledRef.current) break;
-                  setQuotaCountdown(c);
-                  await new Promise((r) => setTimeout(r, 1000));
-                }
+                const realDuration = await getAudioDuration(voiceRes.audioUrl);
+                scene.audioUrl = voiceRes.audioUrl;
+                scene.duration = Math.max(2.5, realDuration + 0.3);
+                scene.status = 'ready'; // Requisito 22: imagen y voz reales
+                scene.voiceOutdated = false;
+                voiceSuccess = true;
+              } catch (vErr: any) {
+                // Requisito 13: Si cuota agotada, reintenta MÁXIMO 2 veces (20 s y 40 s)
+                if (vErr?.isQuotaError) {
+                  if (retryCount < delays.length) {
+                    const waitSec = delays[retryCount];
+                    retryCount++;
+                    setQuotaCountdown(waitSec);
+                    setGenerationStepText(
+                      `Cuota Gemini agotada. Reintento ${retryCount}/2 en ${waitSec} s…`
+                    );
 
-                setQuotaCountdown(null);
-                retryDelay = Math.min(60, retryDelay + 20); // 20s, 40s, 60s
-              } else {
-                scene.status = 'error';
-                scene.errorMessage = 'Error en síntesis de voz.';
-                proj.scenes[i] = scene;
-                onProjectUpdated({ ...proj });
-                await saveProject(proj);
-                break;
+                    for (let c = waitSec; c > 0; c--) {
+                      if (isCancelledRef.current || activeRunIdRef.current !== runId) break;
+                      setQuotaCountdown(c);
+                      await new Promise((r) => setTimeout(r, 1000));
+                    }
+                    setQuotaCountdown(null);
+                  } else {
+                    // Requisito 13: Si sigue fallando tras 2 reintentos, NO esperar más
+                    updatedProj = { ...currentProj, status: 'paused', updatedAt: Date.now() };
+                    projectRef.current = updatedProj;
+                    onProjectUpdated(updatedProj);
+                    await saveProject(updatedProj);
+
+                    setQuotaAlertActive(true);
+                    pipelineRunningRef.current = false;
+                    setIsGenerating(false);
+
+                    await addChatMessage({
+                      sender: 'assistant',
+                      text: 'La cuota gratuita de Gemini para voz se ha agotado tras 2 reintentos (20 s y 40 s). Elige cómo continuar:',
+                      widgetType: 'quota_alert',
+                    });
+                    return; // Fin sin bucle infinito
+                  }
+                } else {
+                  scene.status = 'error';
+                  scene.errorMessage = 'Error en síntesis de voz.';
+                  break;
+                }
               }
             }
           }
+
+          updatedScenes = [...currentProj.scenes];
+          updatedScenes[i] = scene;
+          updatedProj = { ...currentProj, scenes: updatedScenes, updatedAt: Date.now() };
+          projectRef.current = updatedProj;
+          onProjectUpdated(updatedProj);
+          await saveProject(updatedProj);
         }
       }
 
-      const allReady = proj.scenes.every((s) => s.status === 'ready' && s.audioUrl);
-      if (allReady) {
-        proj.status = 'ready';
-        onProjectUpdated({ ...proj });
-        await saveProject(proj);
+      // Requisito 26:
+      // Al terminar "Probar con 2 escenas" muestra tarjeta "Prueba lista" con reproductor, "Exportar prueba" y "Generar video completo".
+      // En el modo completo, si alguna escena falló muestra un mensaje con la lista de escenas con error y un botón "Reintentar las que fallaron".
+      const finalProj = projectRef.current || proj;
+      const testedScenes = testMode ? finalProj.scenes.slice(0, 2) : finalProj.scenes;
+      const testAllReady = testedScenes.every((s) => s.status === 'ready' && s.imageUrl && s.audioUrl);
 
-        // FLOW STEP 5: Final card
+      if (testMode && testAllReady) {
+        finalProj.testMode = true;
+        onProjectUpdated({ ...finalProj });
+        await saveProject(finalProj);
+
         await addChatMessage({
           sender: 'assistant',
-          text: '¡Tu video está listo! Puedes reproducirlo, descargarlo, exportar el audio o editar las escenas:',
-          widgetType: 'video_ready',
+          text: '¡Prueba de 2 escenas completada con éxito! Puedes reproducirla, exportar la prueba o generar el video completo:',
+          widgetType: 'test_ready',
         });
+      } else if (!testMode) {
+        const failedIndices = finalProj.scenes
+          .map((s, idx) => (s.status === 'error' || !s.imageUrl || !s.audioUrl ? idx + 1 : null))
+          .filter(Boolean) as number[];
+
+        if (failedIndices.length > 0) {
+          setFailedScenesIndices(failedIndices);
+          await addChatMessage({
+            sender: 'assistant',
+            text: `La generación finalizó pero ${failedIndices.length} escena(s) presentaron errores (escenas: ${failedIndices.join(', ')}). Puedes reintentarlas:`,
+            widgetType: 'failed_scenes_alert',
+            widgetData: { failedIndices },
+          });
+        } else {
+          finalProj.status = 'ready';
+          onProjectUpdated({ ...finalProj });
+          await saveProject(finalProj);
+
+          await addChatMessage({
+            sender: 'assistant',
+            text: '¡Tu video está listo! Puedes reproducirlo, descargarlo, exportar el audio o editar las escenas:',
+            widgetType: 'video_ready',
+          });
+        }
       }
     } finally {
+      pipelineRunningRef.current = false;
       setIsGenerating(false);
       setGenerationStepText('');
+      setQuotaCountdown(null);
     }
   };
 
@@ -686,7 +1310,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
     showToast(`Reproduciendo voz de escena: "${firstScene.title}"`, 'info');
   };
 
-  // Export and download video
+  // Export and download video (Requisitos 19 y 24)
   const handleExportFinalVideo = async () => {
     const proj = projectRef.current;
     if (!proj) return;
@@ -695,12 +1319,14 @@ export const ChatView: React.FC<ChatViewProps> = ({
     setExportProgress(0);
     setVoiceWarning(false);
 
+    let composer: VideoComposer | null = null;
+
     try {
       const canvas = document.createElement('canvas');
-      const composer = new VideoComposer(canvas, proj);
+      composer = new VideoComposer(canvas, proj);
       await composer.preloadAssets();
 
-      // Check missing scenes (Req 13)
+      // Check missing scenes
       const missing = composer.getMissingVoiceScenes();
       if (missing.length > 0) {
         showToast(
@@ -714,20 +1340,21 @@ export const ChatView: React.FC<ChatViewProps> = ({
       showToast('No bloquees el celular ni cambies de app mientras se exporta', 'info');
 
       const result = await composer.exportVideo((pct) => setExportProgress(pct));
-      const { blob, mimeType, hasVoice } = result;
+      const { blob, mimeType, hasVoice, maxVoicePeak } = result;
 
       const url = URL.createObjectURL(blob);
       setExportedVideoUrl(url);
       setExportedVideoBlob(blob);
+      setVoiceVolumePeak(maxVoicePeak);
 
-      // Requisito 17: Medir nivel de voz; si es cero, advertencia roja grande y NO auto descargar
+      // Requisito 19: Si el pico de voz es casi cero avisa en rojo, pero SÍ deja descargar con un botón "Descargar de todos modos"
       if (!hasVoice) {
         setVoiceWarning(true);
-        showToast('Atención: Este video salió sin voz. No lo subas.', 'error');
+        showToast('Atención: Nivel de voz casi nulo en este video.', 'error');
         return;
       }
 
-      // Auto download
+      // Auto download si tiene voz
       const safeTitle = (proj.title || 'video').toLowerCase().replace(/[^a-z0-9]/g, '_');
       const ext = mimeType.includes('mp4') ? 'mp4' : 'webm';
       const a = document.createElement('a');
@@ -740,8 +1367,26 @@ export const ChatView: React.FC<ChatViewProps> = ({
     } catch (err: any) {
       showToast(err?.message || 'Error al empaquetar el video', 'error');
     } finally {
+      // Requisito 24: llama a composer.destroy() en un finally
+      if (composer) {
+        composer.destroy();
+      }
       setIsExporting(false);
     }
+  };
+
+  const handleForceDownload = () => {
+    if (!exportedVideoUrl) return;
+    const proj = projectRef.current;
+    const safeTitle = (proj?.title || 'video').toLowerCase().replace(/[^a-z0-9]/g, '_');
+    const ext = exportedVideoBlob?.type?.includes('mp4') ? 'mp4' : 'webm';
+    const a = document.createElement('a');
+    a.href = exportedVideoUrl;
+    a.download = `${safeTitle}.${ext}`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    showToast('Video descargado de todos modos', 'info');
   };
 
   // Requisito 18: Escuchar el video exportado antes de descargarlo
@@ -1453,6 +2098,28 @@ export const ChatView: React.FC<ChatViewProps> = ({
 
       {/* BOTTOM INPUT BAR (Fixed, iPhone Safe Area) */}
       <footer className="w-full bg-slate-950/95 backdrop-blur-md border-t border-slate-800/80 p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+        {/* Requisito 1: Barra de resumen de modelos activa e interactiva */}
+        <div className="max-w-4xl mx-auto mb-2">
+          <button
+            type="button"
+            onClick={() => setIsModelSheetOpen(true)}
+            className="w-full flex items-center justify-between gap-2 px-3 py-1.5 rounded-xl bg-slate-900/90 border border-indigo-500/30 hover:border-indigo-400 text-xs text-indigo-200 hover:text-white transition shadow-sm group"
+            title="Abrir selector de modelos para Guion, Imagen y Voz"
+          >
+            <div className="flex items-center gap-2 truncate">
+              <Cpu className="w-3.5 h-3.5 text-indigo-400 shrink-0 group-hover:rotate-12 transition-transform" />
+              <span className="font-bold text-white shrink-0">Modelos:</span>
+              <span className="text-slate-300 font-medium truncate text-[11px] sm:text-xs">
+                {getModelSummaryText()}
+              </span>
+            </div>
+            <div className="flex items-center gap-1 text-[11px] font-semibold text-indigo-400 shrink-0">
+              <span className="hidden sm:inline">Cambiar</span>
+              <ChevronRight className="w-3.5 h-3.5" />
+            </div>
+          </button>
+        </div>
+
         {/* Pending Attachment preview bar if any */}
         {pendingScriptAttachment && (
           <div className="mb-2 p-2 rounded-xl bg-slate-900 border border-indigo-500/40 flex items-center justify-between text-xs text-indigo-300">
@@ -1480,6 +2147,17 @@ export const ChatView: React.FC<ChatViewProps> = ({
             title="Adjuntar guion o música"
           >
             <Plus className="w-5 h-5" />
+          </button>
+
+          {/* Requisito 1: Boton Modelos junto a la barra de mensaje */}
+          <button
+            type="button"
+            onClick={() => setIsModelSheetOpen(true)}
+            className="h-11 px-3 rounded-2xl bg-slate-900 border border-slate-800 hover:border-indigo-500 flex items-center gap-1.5 text-slate-300 hover:text-white hover:bg-slate-800 active:scale-95 transition shrink-0"
+            title="Configurar Modelos (Guion, Imagen y Voz)"
+          >
+            <Cpu className="w-4 h-4 text-indigo-400" />
+            <span className="text-xs font-bold text-slate-200 hidden sm:inline">Modelos</span>
           </button>
 
           {/* Growing textarea */}
@@ -1802,6 +2480,14 @@ export const ChatView: React.FC<ChatViewProps> = ({
           </div>
         </div>
       )}
+
+      {/* REQUISITOS 1, 2, 3: SELECTOR DE MODELOS GUION, IMAGENES Y VOZ */}
+      <ModelSelectorSheet
+        isOpen={isModelSheetOpen}
+        onClose={() => setIsModelSheetOpen(false)}
+        config={activeProj?.modelConfig || getStoredDefaultModels()}
+        onSaveConfig={handleSaveModelConfig}
+      />
     </div>
   );
 };

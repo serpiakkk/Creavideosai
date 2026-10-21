@@ -1,162 +1,131 @@
-# AutoVideo IA — Aplicación PWA de Generación Automatizada de Videos
+# Plan de Implementación: Selector de Modelos Híbrido (Nube / Local) y Estabilización de AutoVideo IA
 
-AutoVideo IA es una aplicación web progresiva (PWA) instalable para iPhone y Android que transforma guiones de texto en español en videos completos listos para YouTube, TikTok y Reels. La app orquesta el análisis de guiones, generación de imágenes coherentes, narración por voz con Gemini TTS, montaje en Canvas a 30 FPS con movimiento Ken Burns, subtítulos dinámicos sincronizados, mezcla de audio con ducking inteligente y exportación a video (MP4/WebM).
+Plan de arquitectura y ejecución para dotar a AutoVideo IA de control total sobre el motor de ejecución de cada tarea (Guion, Imágenes, Voz), combinando la API de Gemini en la nube, modelos locales en el navegador (WebGPU / WASM) que funcionan sin cuota ni conexión, e ilustrador/sintetizador interno sin IA, corrigiendo de forma estricta los 34 requisitos técnicos y de estabilidad.
 
----
-
-### User Review & Critical Decisions
-
-> [!IMPORTANT]
-> Decisiones confirmadas en la fase de clarificación interactiva y configuración del sistema:
-
-- **Estrategia de Voz**: Se utilizará **Gemini TTS** (`gemini-3.8-flash-lite-tts`) con las voces oficiales de Gemini (`Kore`, `Puck`, `Charon`, `Fenrir`, `Zephyr`). En caso de corte de conexión o límite de cuota agotada, se activará un fallback opcional transparente mediante síntesis local del navegador o pausa con guardado de progreso.
-- **Música de Fondo**: Se incluirá un catálogo de pistas instrumentales libres de derechos integradas en la app (Lo-Fi Chill, Upbeat Tech, Cinematic Drama, Corporate Minimal) junto con la opción de subir pistas de audio personalizadas (`.mp3`, `.wav`).
-- **Subtítulos en Video**: Estilo dinámico moderno inspirado en clips virales de TikTok/Shorts (texto en negrita con borde de alto contraste y resaltado activo palabra por palabra con color acento).
-- **Control de Cuota Gratuita**: Cola de peticiones con pausas de 3.5 segundos entre llamadas, reintentos automáticos con retroceso exponencial (*exponential backoff*), persistencia en IndexedDB de cada asset individual (para no volver a gastar cuota en escenas ya generadas) y opción rápida de "Probar con 2 escenas".
+> [!IMPORTANT] Decisiones Críticas y Preferencias Confirmadas
+> - **Descarga de Modelos Locales**: Se descargará 1 modelo potente y 3 modelos ligeros preconfigurados de inicio, con descarga bajo demanda y confirmación de tamaño para modelos adicionales pesados.
+> - **Fallback de Aceleración Gráfica**: Si el dispositivo o navegador no soporta WebGPU para modelos pesados, el sistema cambia automáticamente al motor WASM en CPU y muestra un aviso informativo no bloqueante en pantalla.
+> - **Política de No Regresión**: No se reescribirá la aplicación desde cero. Se preservará la arquitectura y base de datos existente, extendiendo la interfaz común `ModelProvider` de forma modular y actualizando archivo por archivo.
 
 ---
 
-### 1. Overview & Core Concept
+## 1. Visión General y Experiencia de Usuario
 
-- **Qué hace**: Recibe un guion de texto estructurado o en prosa, lo segmenta automáticamente en escenas cronológicas, genera las ilustraciones visuales según el estilo elegido y la narración en audio con duración exacta, compone el video con animaciones de cámara y subtítulos animados, y permite editar o exportar el video final junto a sus archivos individuales (MP4/WebM, audio WAV, imágenes PNG y archivo `.srt`).
-- **Público Objetivo**: Creadores de contenido, educadores, divulgadores, agencias y emprendedores que necesitan producir videos virales y explicativos de alta calidad de forma ágil desde su celular o computadora.
-- **Valor Principal**: Cero fricción de edición técnica; conversión de texto a video autónoma en menos de 2 minutos, con capacidad de ejecutarse en segundo plano y reanudarse ante cualquier interrupción de red.
+AutoVideo IA permitirá al usuario seleccionar con un solo toque desde el chat cómo se procesa cada una de las tres etapas de creación de video:
+1. **Guion**: Gemini en nube (con modelos detectados en tiempo real o ID manual), modelos locales en Web Worker (Qwen / Llama / Gemma de 0.5B a 7B) o analizador local determinista.
+2. **Imágenes**: Ilustrador interno vectorial SVG (sin IA y sin cuota), modelo de difusión rápida en WebGPU (SD-Turbo), o Gemini en la nube.
+3. **Voz**: Gemini TTS en la nube, síntesis local multimodelo en español (Piper TTS ligero, Kokoro TTS medio y modelo neuronal de alta calidad), o audio nativo Web Audio.
 
----
-
-### 2. User Experience & Visual Design
-
-#### Flujo de Pantallas
-1. **Inicio (Biblioteca de Proyectos)**:
-   - Encabezado con estado de conexión PWA, botón de instalación en la pantalla de inicio ("Instalar en Celular") y selector de modo oscuro.
-   - Botón destacado y ergonómico para el pulgar: `+ Nuevo Video`.
-   - Grid de tarjetas de proyectos guardados en IndexedDB con miniatura, título, formato (16:9 / 9:16), fecha y estado (*Borrador*, *Generando*, *Completado*).
-   - Acceso a proyectos de ejemplo precargados para probar al instante sin necesidad de escribir un guion desde cero.
-
-2. **Nuevo Proyecto & Asistente de Guion**:
-   - Título del video y área de texto para el guion en español con soporte de etiquetas (`IMAGEN:`, `##`, `NÚMERO`).
-   - Selector de plantillas de estilo visual (Pizarra / Dibujo a mano, Cómic / Novela gráfica, Vectorial minimalista, Acuarela, Synthwave, Claymation 3D) con prompt editable.
-   - Selector de voz de Gemini con botón de prueba para escuchar una muestra de audio inmediata.
-   - Configuración de velocidad (0.9x a 1.3x) y tono emocional (Informativo, Curioso, Dramático, Entusiasta).
-   - Selector de formato: **16:9 (YouTube)** vs **9:16 (Shorts / TikTok / Reels)**.
-   - Selector de música de fondo (catálogo preinstalado o subida de archivo) con control de volumen relativo.
-   - Acciones principales: **"Probar con 2 escenas"** (ideal para validar estilo y ahorrar cuota) y **"Generar video completo"**.
-
-3. **Generador & Monitor de Progreso en Tiempo Real**:
-   - Barra de progreso general con porcentaje y contador de llamadas realizadas/estimadas.
-   - Mensajes transparentes y comprensibles ("Segmentando guion en 6 escenas...", "Dibujando escena 3 de 6...", "Generando voz de escena 3...").
-   - Lista visual de escenas: cada tarjeta muestra su miniatura en cuanto está lista, badge de estado, duración detectada del audio y botón individual de reintento si ocurre algún error.
-   - Detección de suspensión: el estado se persiste en IndexedDB en cada paso. Si el usuario bloquea el celular o recarga, la app detecta el progreso y muestra el botón "Continuar donde me quedé".
-
-4. **Editor de Escenas & Línea de Tiempo**:
-   - Línea de tiempo visual horizontal e interactiva que muestra las escenas con duración real.
-   - Panel de edición por escena:
-     - Regenerar imagen individual (con opción de ajustar el prompt visual).
-     - Regenerar solo la voz o escucharla por separado.
-     - Editar texto de narración y líneas de subtítulos.
-     - Ajustar duración manual y efecto de cámara: Zoom Lento Adelante (*Ken Burns In*), Zoom Atrás (*Ken Burns Out*), Paneo Izquierda/Derecha o Estático.
-     - Reordenar (subir/bajar), duplicar o eliminar escena.
-     - Añadir nueva escena intermedia.
-
-5. **Vista Previa & Exportación Multimedia**:
-   - Reproductor de video interactivo con pantalla completa y controles táctiles.
-   - Generador en Canvas + Web Audio + MediaRecorder con exportación a `.mp4` / `.webm`.
-   - Botones directos de descarga:
-     - `Descargar Video` (calidad alta).
-     - `Descargar Audio Completo` (WAV/MP3).
-     - `Descargar Subtítulos (.srt)`.
-     - `Descargar Paquete de Imágenes (ZIP / Individual)`.
-   - Botón de compartir nativo móvil (`navigator.share`) para enviar directamente a WhatsApp, Telegram o redes sociales.
-   - Herramientas extras: "Generar título, descripción y etiquetas para YouTube" y "Generar miniatura 16:9 de alto impacto".
-
-#### Identidad Visual & Ergonomía
-- **Tema**: Modo oscuro nativo elegante (`bg-slate-950` con tarjetas `bg-slate-900/90` y bordes finos `border-slate-800`).
-- **Acento**: Índigo vibrante / Violeta eléctrico (`#6366f1` / `#4f46e5`) con alto contraste para botones primarios táctiles.
-- **Tipografía**: *Plus Jakarta Sans* para títulos y textos de interfaz, con fuentes monoespaciadas para duraciones numéricas (*tabular-nums*).
-- **Zonas Táctiles (Thumb Zone)**: Barra de navegación inferior móvil (`fixed bottom-0 pb-safe`) y botones de acción primaria con al menos 48px de altura y feedback táctil inmediato (`active:scale-[0.98]`).
-- **Soporte Notch & Safe Areas**: Uso de variables CSS `env(safe-area-inset-top)` y `env(safe-area-inset-bottom)`.
+El usuario dispondrá de un botón dinámico **"Modelos"** junto a la barra de entrada del chat que resumirá en tiempo real la configuración activa (`Guion: X · Imagen: Y · Voz: Z`), abriendo una hoja inferior deslizable adaptada a pantallas móviles (iPhone) y escritorio.
 
 ---
 
-### 3. Key Product Decisions & Trade-Offs
-
-- **Compositor de Video en Dispositivo (Client-Side Canvas & Web Audio API)**:
-  - *Decisión*: Renderizar el video en el cliente combinando Canvas 2D acelerado por hardware para efectos Ken Burns y subtítulos, junto a un grafo de Web Audio con nodos de ganancia dinámica para el audio ducking de la música de fondo.
-  - *Por qué*: Cero costo de procesamiento en servidor, exportación instantánea sin colas de renderizado externas, total privacidad del usuario y compatibilidad offline.
-  - *Alternativa descartada*: Enviar frames a un servidor FFmpeg remoto, lo cual requeriría infraestructura costosa y fallaría sin internet.
-
-- **Persistencia Completa en IndexedDB**:
-  - *Decisión*: Almacenar en IndexedDB no solo los metadatos de los proyectos, sino también los Blobs de audio y las imágenes en Base64/Blob.
-  - *Por qué*: Si se agota la cuota de la API o se cierra la pestaña, ningún asset generado se pierde. El usuario puede retomar en cualquier instante sin consumir llamadas redundantes a la API.
-
-- **Mitigación de Límites de Cuota (Free Tier Throttling & Safety Guard)**:
-  - *Decisión*: Cola asíncrona secuencial con delay programado (mínimo 3.5 segundos entre peticiones de imágenes y voz), contador visual de operaciones y reintentos exponenciales con suavizado automático de prompts si saltan filtros de seguridad.
-  - *Por qué*: La API de Gemini en nivel gratuito impone límites estrictos de peticiones por minuto (RPM). La cola garantiza que la generación no sufra errores de rate limit (429).
-
-- **Estructura PWA Completa**:
-  - *Decisión*: Configuración con `vite-plugin-pwa`, manifest manifest.webmanifest con display `standalone`, service worker con caché Workbox y banner de instalación adaptativo (Chromium `beforeinstallprompt` + guía visual para iOS Safari).
-
----
-
-### 4. Technical Architecture & Data Strategy
+## 2. Arquitectura del Sistema y Flujo de Datos
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
-│                        AutoVideo IA PWA (React + Vite)                 │
-├────────────────────────────────────────────────────────────────────────┤
-│  Vistas:                                                               │
-│   [Inicio] ──> [Nuevo Proyecto] ──> [Generación] ──> [Editor / Export] │
-├────────────────────────────────────────────────────────────────────────┤
-│  Servicios Frontend:                                                   │
-│   • VideoComposer: Canvas 2D + Ken Burns + Subtitle Engine             │
-│   • AudioEngine: Web Audio API (Ducking dinámico de música)            │
-│   • MediaExporter: MediaRecorder (Canvas Stream + Audio Stream)        │
-│   • ProjectStore: IndexedDB (Proyectos, Escenas, Blobs de Audio/Img)   │
-│   • PWAEngine: Service Worker, Manifest, Install Prompt                │
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │ Peticiones /api/*
-                                    ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│                 Backend Proxy Express (server.ts / Vite)               │
-├────────────────────────────────────────────────────────────────────────┤
-│   • POST /api/script/parse       -> Gemini 3.8 Flash (guion a escenas) │
-│   • POST /api/image/generate     -> Gemini 3.1 Flash Lite Image        │
-│   • POST /api/voice/generate     -> Gemini 3.8 Flash Lite TTS (WAV)    │
-│   • POST /api/youtube/metadata   -> Gemini 3.8 Flash (SEO YouTube)     │
-└────────────────────────────────────────────────────────────────────────┘
+│                        INTERFAZ DE CHAT (ChatView)                     │
+│  Barra de entrada con Botón "+" (Adjuntos) y Botón "Modelos"           │
+└──────────────────┬─────────────────────────────────┬───────────────────┘
+                   │                                 │
+                   ▼                                 ▼
+      ┌─────────────────────────┐       ┌────────────────────────┐
+      │   Selector de Modelos   │       │   Gestor de Ejecución  │
+      │   (Hoja Inferior Modal) │       │   (runId + Lock Ref)   │
+      │  Guion · Imagen · Voz   │       └───────────┬────────────┘
+      └────────────┬────────────┘                   │
+                   │                                │
+     ┌─────────────┴───────────────┐                │
+     ▼                             ▼                ▼
+┌─────────────────────────┐   ┌──────────────────────────────────────────┐
+│   PROVEEDOR NUBE        │   │          PROVEEDOR LOCAL                 │
+│   (Gemini Cloud API)    │   │      (En el navegador vía Worker)        │
+│                         │   │                                          │
+│ • Detectar modelos API  │   │ • WebLLM / Transformers.js               │
+│ • Timeout por tarea:    │   │ • WebGPU con fallback transparente WASM  │
+│   - Guion: 60s          │   │ • Voz: Piper TTS & Kokoro TTS (ES)       │
+│   - Voz / Imagen: 90s   │   │ • Difusión: SD-Turbo WebGPU              │
+│ • Detección de Cuota:   │   │ • Caché persistente (navigator.storage)  │
+│   Máx 2 reintentos      │   │ • Gestión de memoria (1 modelo activo)   │
+│   (20s, 40s) -> Opciones│   │ • Ilustrador Vectorial Interno (sin IA)  │
+└─────────────────────────┘   └──────────────────────────────────────────┘
+                   │                                │
+                   └───────────────┬────────────────┘
+                                   ▼
+                      ┌──────────────────────────┐
+                      │ VideoComposer & Export   │
+                      │ (Web Audio + Canvas +    │
+                      │  AnalyserNode fft: 2048) │
+                      └──────────────────────────┘
 ```
-
-#### Modelo de Datos Principal (IndexedDB)
-- **`VideoProject`**:
-  - `id`: string (UUID)
-  - `title`: string
-  - `createdAt`: number
-  - `aspectRatio`: "16:9" | "9:16"
-  - `visualStyle`: string
-  - `voiceName`: string ("Kore" | "Puck" | "Charon" | "Fenrir" | "Zephyr")
-  - `voiceSpeed`: number (0.9 a 1.3)
-  - `voiceTone`: string
-  - `backgroundMusic`: { id: string; name: string; volume: number; customAudioBlob?: Blob }
-  - `status`: "draft" | "generating" | "ready" | "error"
-  - `scenes`: `SceneItem[]`
-- **`SceneItem`**:
-  - `id`: string
-  - `order`: number
-  - `title`: string
-  - `narrationText`: string
-  - `visualPrompt`: string
-  - `imageUrl`: string (base64 o Blob URL)
-  - `audioBlob`: Blob (audio WAV de la narración)
-  - `duration`: number (segundos reales calculados a partir del audio)
-  - `cameraMotion`: "zoom_in" | "zoom_out" | "pan_left" | "pan_right" | "static"
-  - `transition`: "fade" | "cut" | "crossfade"
-  - `status`: "pending" | "generating_image" | "generating_voice" | "ready" | "error"
-  - `errorMessage`?: string
 
 ---
 
-### Verificación y Entregables
-1. Verificación de compilación limpia de la app y del backend (`npm run build` / `compile_applet`).
-2. Comprobación de instalación PWA: archivo manifest, service worker activo, íconos y banner de instalación.
-3. Pruebas del flujo de "Probar con 2 escenas" para validar el montaje completo con consumo mínimo de cuota.
-4. Generación de video con Canvas, audio ducking, subtítulos dinámicos y descarga funcional en formato MP4/WebM y `.srt`.
+## 3. Plan de Implementación por Fases
+
+### Fase 1: Arquitectura de Modelos y Tipos (`src/types/index.ts`, `src/services/modelProvider.ts`)
+- Extender `VideoProject` y el estado global para almacenar:
+  - `modelConfig`: `{ script: ModelChoice, image: ModelChoice, voice: ModelChoice }`.
+  - `fallbackImagePreference`: `'ask' | 'use_fallback' | 'wait_retry'`.
+- Crear el contrato común `ModelProvider`:
+  - `parseScript(text, style, characterDesc, maxTokens)`
+  - `generateImage(prompt, aspectRatio, context)`
+  - `generateVoice(text, voiceId, speed, tone)`
+- Implementar la detección de capacidades de hardware del cliente:
+  - Comprobación de `navigator.gpu` (límites de memoria de buffer y adaptadores).
+  - Detección de `navigator.deviceMemory`, núcleos de CPU y detección de dispositivo iOS (iPhone/iPad).
+  - Clasificación de modelos: *Recomendado*, *Funciona pero lento*, o *Puede cerrar la app*.
+- Manejo de persistencia de almacenamiento con `navigator.storage.persist()` e inspección de cuota usada (`navigator.storage.estimate()`).
+
+### Fase 2: Motor Local en Web Worker (`src/workers/modelWorker.ts`, `src/services/localModelService.ts`)
+- Configurar un Web Worker aislado para evitar bloquear el hilo de renderizado de la UI.
+- Integración de Transformers.js (`@huggingface/transformers`) y WebLLM:
+  - Carga y liberación estricta de memoria (solo un modelo cargado a la vez, con método `dispose()`).
+  - Reporte de progreso de descarga porcentaje a porcentaje con cancelación limpia.
+  - Implementación de los 3 niveles de voz local en español (Piper TTS ligero, Kokoro TTS medio y modelo neuronal) con conversión directa a WAV PCM.
+  - Implementación de los 3 niveles de guion local (<1B, 3-4B, 7-8B) con validación de JSON y fallback directo al analizador determinista.
+  - Soporte para SD-Turbo en WebGPU para imágenes locales estilo pizarra con prompt negativo.
+
+### Fase 3: Endpoints del Servidor y Detección de Gemini (`server.ts`)
+- Nuevo endpoint `GET /api/models/available`: Llama a `ai.models.list()` para devolver los modelos reales activos para la clave de API del usuario.
+- Nuevo endpoint `POST /api/models/test`: Prueba de latencia mínima para verificar cuota de un modelo concreto.
+- Actualización de timeouts en `server.ts`: 60 s para análisis de guion, 90 s para voz e imágenes (retirando el timeout global corto de 15 s).
+- En `/api/voice/generate`: Detección de `inlineData.mimeType`. Si devuelve audio crudo PCM/L16, agregar dinámicamente la cabecera WAV estándar (44 bytes, 24000 Hz, 16 bits, mono).
+- En `/api/chat/command`: Procesamiento de orden de comandos priorizando "regenerar imagen/voz de escena N", y delimitando comandos de formato a frases explícitas con "formato" o "cambia a/hazlo en".
+
+### Fase 4: Experiencia en el Chat (`src/views/ChatView.tsx`)
+- Botón **"Modelos"** fijo junto a la barra de entrada con etiqueta de estado (`Guion: X · Imagen: Y · Voz: Z`).
+- Hoja inferior deslizante (`ModelSelectorSheet`) con las tres pestañas (Guion, Imagen, Voz) y categorías *Nube*, *Local* e *Interno*.
+- Control de cuota en generación: Máximo 2 reintentos (20 s y 40 s). Si persiste, mostrar mensaje interactivo con botones: *"Cambiar a modelo local"*, *"Esperar 1 minuto"* y *"Detener"*.
+- Manejo de concurrencia: Bloqueo de proceso con `runId` y referencia `pipelineRunning` para impedir dobles ejecuciones.
+- Botón "Detener" siempre visible durante la generación.
+- Validación estricta de nuevo guion en `handleSendMessage`: Solo se considera guion si hay adjunto, si no hay escenas y tiene >120 caracteres, o si empieza con `##`. Si ya hay escenas, pedir confirmación interactiva (*"Reemplazar guion"* / *"Cancelar"*).
+- Estilo predeterminado: *"Pizarra con muñecos de palitos"* como primero y predeterminado con su prompt completo.
+- Tarjeta *"Prueba lista"* tras probar con 2 escenas, con reproductor, *"Exportar prueba"* y *"Generar video completo"*.
+
+### Fase 5: Estabilidad del Compositor de Video (`src/services/videoComposer.ts`, `src/views/PreviewExportView.tsx`)
+- En `videoComposer.ts`:
+  - `AnalyserNode` con `fftSize = 2048` inicializado en `initAudioGraph` conectado como derivación limpia de la salida del compresor de voz.
+  - Generación de música de fondo sintetizada en búfer en bucle de 30 segundos (con caché), evitando la creación de búferes masivos de toda la duración.
+  - Medición del pico de voz durante la exportación. Si es cero o casi inaudible, mostrar advertencia en rojo pero habilitar el botón *"Descargar de todos modos"*.
+  - Llamada a `composer.destroy()` en el bloque `finally` de la exportación.
+- En `PreviewExportView.tsx`:
+  - Deshabilitar el botón de exportación hasta que `preloadAssets` haya completado.
+  - Sincronizar *"Descargar audio"* con `exportFullNarrationWav` y compartir mediante `navigator.share({ files })`.
+
+### Fase 6: Correcciones Puntuales de Soporte (`src/services/docReader.ts`, `src/App.tsx`)
+- En `docReader.ts`: Detección case-insensitive para `.txt`, `.md`, `.docx`, emitiendo *"Formato no soportado"* en otros casos.
+- En `App.tsx`: En `handleProjectUpdated`, si el proyecto no existe en la lista, insertarlo. Cuando `ChatView` cree un proyecto nuevo, seleccionarlo como proyecto activo inmediatamente.
+- Limpieza de narración (`cleanNarration`): Conservar paréntesis informativos y retirar únicamente acotaciones escénicas y marcas visuales.
+
+---
+
+## 4. Estrategia de Prueba y Verificación
+
+1. **Compilación y Linteo**: Ejecutar `compile_applet` y `lint_applet` para garantizar cero errores de TypeScript y empaquetado Vite.
+2. **Prueba 100% Local sin Cuota**:
+   - Activar: Guion Local Ligero + Ilustrador Interno Vectorial + Voz Local Ligera (Piper).
+   - Crear un proyecto con 2 escenas mediante el comando o los chips del selector.
+   - Verificar que no se realice ninguna llamada a los endpoints de Gemini.
+   - Observar la generación de las ilustraciones vectoriales dinámicas y la reproducción del audio WAV sintetizado por el motor local.
+   - Comprobar que el medidor de voz del AnalyserNode reaccione durante la exportación y que el video resultante se reproduzca con audio claro.

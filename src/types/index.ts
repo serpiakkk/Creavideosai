@@ -38,6 +38,49 @@ export interface BackgroundMusicConfig {
   customAudioUrl?: string;
 }
 
+export type ModelProviderType = 'gemini' | 'local' | 'internal';
+
+export interface SelectedModel {
+  provider: ModelProviderType;
+  modelId: string;
+  modelName: string;
+  sizeLabel?: string;
+  tier?: 'light' | 'medium' | 'heavy';
+}
+
+export interface TaskModelConfig {
+  script: SelectedModel;
+  image: SelectedModel;
+  voice: SelectedModel;
+}
+
+export interface HardwareCapabilities {
+  hasWebGPU: boolean;
+  adapterInfo?: string;
+  deviceMemoryGB?: number;
+  hardwareConcurrency: number;
+  isIOS: boolean;
+  storageQuotaMB?: number;
+  storageUsedMB?: number;
+  isPersisted: boolean;
+}
+
+export interface ModelItem {
+  id: string;
+  name: string;
+  task: 'script' | 'image' | 'voice';
+  provider: ModelProviderType;
+  tier?: 'light' | 'medium' | 'heavy';
+  downloadSize: string;
+  requirements: string;
+  quality: string;
+  speed: string;
+  status: 'not_downloaded' | 'downloading' | 'installed' | 'unsupported';
+  downloadProgress?: number;
+  suitability: 'recommended' | 'slow' | 'may_crash';
+  description?: string;
+}
+
 export interface ChatMessage {
   id: string;
   sender: 'user' | 'assistant';
@@ -48,7 +91,7 @@ export interface ChatMessage {
     type: 'script' | 'music' | 'image';
     snippet?: string;
   };
-  widgetType?: 'script_parsed' | 'generating_progress' | 'video_ready' | 'quota_alert' | 'fallback_image_prompt';
+  widgetType?: 'script_parsed' | 'generating_progress' | 'video_ready' | 'quota_alert' | 'fallback_image_prompt' | 'models_sheet' | 'test_ready';
   widgetData?: any;
 }
 
@@ -70,6 +113,8 @@ export interface VideoProject {
   testMode?: boolean; // If tested with only 2 scenes
   thumbnailSubtitle?: string; // Editable subtitle for YouTube thumbnail
   fallbackImagePreference?: 'ask' | 'use_fallback' | 'wait_retry';
+  modelConfig?: TaskModelConfig;
+  characterDescription?: string;
   chatHistory?: ChatMessage[];
 }
 
@@ -95,3 +140,4 @@ export interface YouTubeMetadata {
   tags: string[];
   hashtags: string[];
 }
+

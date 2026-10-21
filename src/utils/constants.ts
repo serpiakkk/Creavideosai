@@ -3,11 +3,11 @@ import { VisualPreset, VoiceOption } from '../types';
 export const VISUAL_PRESETS: VisualPreset[] = [
   {
     id: 'whiteboard',
-    name: 'Pizarra / Dibujo a Mano',
+    name: 'Pizarra con muñecos de palitos',
     badge: 'Por Defecto',
     description: 'Estilo dibujo animado en pizarra blanca con trazos gruesos en tinta negra y acentos rojos.',
     prompt:
-      'Simple 2D whiteboard animation style illustration, hand-drawn stick figure with round head and thick black outlines, white background, minimal flat colors with red accents, clean cartoon icons, lots of empty space, no realistic faces, no copyrighted characters, only short Spanish text labels.',
+      'Simple 2D whiteboard animation style illustration, hand-drawn stick figure with round head and thick black outlines, white background, minimal flat colors with red accents, clean cartoon icons, lots of empty space, 16:9, no realistic faces, no copyrighted characters, only short Spanish text labels.',
   },
   {
     id: 'comic',

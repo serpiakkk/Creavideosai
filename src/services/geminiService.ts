@@ -117,12 +117,25 @@ export function splitScriptIntoBlocks(rawScript: string): ScriptBlock[] {
   }];
 }
 
-// 1. Parse Script en bloques (Requisito 9)
+// Helper según Requisito 33: quita solo líneas "IMAGEN:", encabezados markdown y acotaciones actorales; no borra paréntesis con datos
+function cleanNarration(text: string): string {
+  return (text || '')
+    .replace(/^(?:IMAGEN|IMÁGEN|VISUAL):.*$/gim, '')
+    .replace(/#{1,6}\s.*$/gm, '')
+    .replace(/\((?:suspiro|suspirando|risa|risas|riendo|pausa|silencio|tose|tos|gasp|bostezo|llanto|aplausos|música|tono\s+[^)]*|acotaci[oó]n[^)]*)\)/gi, '')
+    .replace(/\[(?:suspiro|risa|pausa|silencio|tose|gasp|bostezo|música|efecto).*?\]/gi, '')
+    .replace(/\*+/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// 1. Parse Script en bloques (Requisitos 9, 21, 23, 28)
 export async function parseScriptWithGemini(
   script: string,
   visualStyle: string,
-  maxScenes?: number
-): Promise<ParseScriptResult> {
+  maxScenes?: number,
+  modelId?: string
+): Promise<ParseScriptResult & { characterDescription?: string }> {
   const blocks = splitScriptIntoBlocks(script);
 
   // If in testMode with maxScenes, restrict blocks
@@ -137,7 +150,8 @@ export async function parseScriptWithGemini(
 
   const allScenes: ParsedScene[] = [];
   let suggestedTitle = '';
-  let modelUsed = 'gemini-3.1-flash-lite';
+  let modelUsed = modelId || 'gemini-3.1-flash-lite';
+  let characterDescription: string | undefined = undefined;
 
   for (let chunkIdx = 0; chunkIdx < chunkedBlocks.length; chunkIdx++) {
     const chunk = chunkedBlocks[chunkIdx];
@@ -154,6 +168,7 @@ export async function parseScriptWithGemini(
     while (!chunkSuccess && attempts < 2) {
       attempts++;
       try {
+        // Requisito 28: pasa characterDescription guardada y maxOutputTokens
         const response = await fetch('/api/script/parse', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -161,6 +176,8 @@ export async function parseScriptWithGemini(
             script: chunkScript,
             visualStyle,
             maxOutputTokens: 8192,
+            characterDescription,
+            modelId,
           }),
         });
 
@@ -173,22 +190,30 @@ export async function parseScriptWithGemini(
           suggestedTitle = data.title;
         }
 
+        // Requisito 28: guardar characterDescription del primer bloque para los siguientes
+        if (data.characterDescription && !characterDescription) {
+          characterDescription = data.characterDescription;
+        }
+
         const chunkScenes: ParsedScene[] = (data.scenes || []).map((sc: any, idx: number) => {
-          const correspondingBlock = chunk[idx] || chunk[chunk.length - 1];
+          // Requisito 28: Empareja escenas con bloques por título, no por posición
+          const cleanTitle = (sc.title || '').trim().toLowerCase();
+          const correspondingBlock =
+            chunk.find((b) => b.headerTitle.trim().toLowerCase() === cleanTitle) ||
+            chunk.find((b) => cleanTitle.includes(b.headerTitle.trim().toLowerCase()) || b.headerTitle.trim().toLowerCase().includes(cleanTitle)) ||
+            chunk[idx] ||
+            chunk[chunk.length - 1];
+
           // Ensure visualDescription incorporates local extraction if present
           const finalVisualDesc = correspondingBlock?.localVisualDescription || sc.visualDescription || sc.title;
-          // Ensure narrationText never has IMAGEN: or visual notes
-          const cleanNarration = (sc.narrationText || '')
-            .replace(/^(IMAGEN|IMÁGEN|VISUAL):.*$/gim, '')
-            .replace(/\(([^)]*)\)/g, '')
-            .trim();
+          const cleanedNarr = cleanNarration(sc.narrationText || '');
 
           return {
             title: sc.title || correspondingBlock?.headerTitle || `Escena ${allScenes.length + idx + 1}`,
-            narrationText: cleanNarration,
+            narrationText: cleanedNarr,
             visualDescription: finalVisualDesc,
             visualPrompt: sc.visualPrompt || `${visualStyle}: ${finalVisualDesc}`,
-            estimatedDuration: sc.estimatedDuration || 4.0,
+            estimatedDuration: sc.estimatedDuration || Math.max(3.0, (cleanedNarr.split(/\s+/).length / 2.3)),
             cameraMotion: sc.cameraMotion || 'zoom_in',
             keywords: sc.keywords || [],
           };
@@ -202,15 +227,18 @@ export async function parseScriptWithGemini(
         if (attempts >= 2) {
           // Fallback local solo para este bloque, sin perder los demás
           console.warn(`Usando estructuración local para el bloque ${chunkIdx + 1}`);
-          const fallbackScenes: ParsedScene[] = chunk.map((b, idx) => ({
-            title: b.headerTitle,
-            narrationText: b.rawContent.replace(/^(IMAGEN|IMÁGEN|VISUAL):.*$/gim, '').trim(),
-            visualDescription: b.localVisualDescription || b.headerTitle,
-            visualPrompt: `${visualStyle}: ${b.localVisualDescription || b.headerTitle}`,
-            estimatedDuration: Math.max(3.0, (b.rawContent.split(/\s+/).length / 2.4)),
-            cameraMotion: 'zoom_in',
-            keywords: ['resumen', 'clave'],
-          }));
+          const fallbackScenes: ParsedScene[] = chunk.map((b) => {
+            const narr = cleanNarration(b.rawContent);
+            return {
+              title: b.headerTitle,
+              narrationText: narr,
+              visualDescription: b.localVisualDescription || b.headerTitle,
+              visualPrompt: `${visualStyle}: ${b.localVisualDescription || b.headerTitle}`,
+              estimatedDuration: Math.max(3.0, (narr.split(/\s+/).length / 2.3)),
+              cameraMotion: 'zoom_in',
+              keywords: ['resumen', 'clave'],
+            };
+          });
           allScenes.push(...fallbackScenes);
           chunkSuccess = true;
         } else {
@@ -225,7 +253,7 @@ export async function parseScriptWithGemini(
     scenes: allScenes.length > 0 ? allScenes : [
       {
         title: 'Escena 1',
-        narrationText: script.replace(/^(IMAGEN|IMÁGEN|VISUAL):.*$/gim, '').trim(),
+        narrationText: cleanNarration(script),
         visualDescription: 'Ilustración explicativa de la escena',
         visualPrompt: `${visualStyle}: Ilustración explicativa`,
         estimatedDuration: 4.5,
@@ -234,8 +262,10 @@ export async function parseScriptWithGemini(
       },
     ],
     modelUsed,
+    characterDescription,
   };
 }
+
 
 // 1.1 Enhance Script with Gemini
 export async function enhanceScriptWithGemini(
@@ -373,10 +403,33 @@ export async function sendChatCommand(
   userMessage: string,
   currentProject: VideoProject
 ): Promise<ChatCommandResult> {
+  // Requisito 25: manda solo título, número de escenas, voz, formato y música, no el proyecto completo con imágenes y audios
+  const compactProject = {
+    title: currentProject.title,
+    scenesCount: currentProject.scenes?.length || 0,
+    voiceName: currentProject.voiceName,
+    aspectRatio: currentProject.aspectRatio,
+    music: {
+      presetType: currentProject.music?.presetType,
+      type: currentProject.music?.type,
+      volume: currentProject.music?.volume,
+    },
+    // Memoria contextual: ultimos 10 mensajes y resumen de texto de escenas sin imagenes ni audios
+    chatHistory: (currentProject.chatHistory || []).slice(-10).map((m) => ({
+      sender: m.sender,
+      text: m.text,
+    })),
+    scenesSummary: (currentProject.scenes || []).map((s) => ({
+      order: s.order,
+      title: s.title,
+      narration: s.narrationText ? s.narrationText.slice(0, 150) : '',
+    })),
+  };
+
   const response = await fetch('/api/chat/command', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ userMessage, currentProject }),
+    body: JSON.stringify({ userMessage, currentProject: compactProject }),
   });
 
   const data = await response.json();

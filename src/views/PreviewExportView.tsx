@@ -53,9 +53,11 @@ export const PreviewExportView: React.FC<PreviewExportViewProps> = ({
   const [audioStatusText, setAudioStatusText] = useState('Voz normalizada lista');
 
   // Export States
+  const [isAssetsLoaded, setIsAssetsLoaded] = useState(false);
   const [isExportingVideo, setIsExportingVideo] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
+  const [downloadBlob, setDownloadBlob] = useState<Blob | null>(null);
   const [downloadFileName, setDownloadFileName] = useState('');
 
   // YouTube SEO Modal State
@@ -72,6 +74,7 @@ export const PreviewExportView: React.FC<PreviewExportViewProps> = ({
   useEffect(() => {
     if (!canvasRef.current) return;
 
+    setIsAssetsLoaded(false);
     const composer = new VideoComposer(canvasRef.current, project, (state) => {
       setIsPlaying(state.isPlaying);
       setCurrentTime(state.currentTime);
@@ -82,7 +85,14 @@ export const PreviewExportView: React.FC<PreviewExportViewProps> = ({
 
     composer.voiceVolumeBooster = voiceBooster;
     composerRef.current = composer;
-    composer.preloadAssets();
+
+    // Requisito 31: espera preloadAssets antes de habilitar exportar
+    composer.preloadAssets().then(() => {
+      setIsAssetsLoaded(true);
+    }).catch((err) => {
+      console.warn('Error en preloadAssets:', err);
+      setIsAssetsLoaded(true); // permitir para no bloquear
+    });
 
     return () => {
       composer.destroy();
@@ -154,6 +164,7 @@ export const PreviewExportView: React.FC<PreviewExportViewProps> = ({
 
       const url = URL.createObjectURL(blob);
       setDownloadUrl(url);
+      setDownloadBlob(blob);
       setDownloadFileName(fileName);
 
       // Auto trigger download
@@ -187,20 +198,23 @@ export const PreviewExportView: React.FC<PreviewExportViewProps> = ({
     showToast('Subtítulos .SRT descargados con éxito', 'success');
   };
 
-  // 3. Export Audio Only (WAV)
-  const handleExportAudio = () => {
-    const firstAudioScene = project.scenes.find((s) => s.audioUrl);
-    if (!firstAudioScene?.audioUrl) {
-      showToast('No hay audios disponibles para descargar.', 'error');
-      return;
+  // 3. Export Audio Only (WAV) - Requisito 31: usa exportFullNarrationWav
+  const handleExportAudio = async () => {
+    if (!composerRef.current) return;
+    try {
+      showToast('Generando pista de narración completa unida en WAV...', 'info');
+      const wavBlob = await composerRef.current.exportFullNarrationWav();
+      const url = URL.createObjectURL(wavBlob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${project.title || 'narracion'}_completa.wav`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      showToast('Narración completa descargada en WAV', 'success');
+    } catch (err: any) {
+      showToast('Error al exportar audio: ' + (err?.message || 'Error'), 'error');
     }
-    const a = document.createElement('a');
-    a.href = firstAudioScene.audioUrl;
-    a.download = `${project.title || 'narracion'}_audio.wav`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    showToast('Pista de audio descargada', 'success');
   };
 
   // 4. Export Images as ZIP
@@ -236,8 +250,27 @@ export const PreviewExportView: React.FC<PreviewExportViewProps> = ({
     showToast('Archivo ZIP con todas las imágenes descargado', 'success');
   };
 
-  // 5. Share Video
+  // 5. Share Video - Requisito 31: comparte el archivo exportado si existe
   const handleShare = async () => {
+    if (downloadBlob && typeof navigator !== 'undefined' && navigator.share) {
+      try {
+        const ext = (downloadFileName || '').endsWith('.mp4') ? 'mp4' : 'webm';
+        const file = new File([downloadBlob], downloadFileName || `video.${ext}`, {
+          type: downloadBlob.type || 'video/mp4',
+        });
+        if (navigator.canShare && navigator.canShare({ files: [file] })) {
+          await navigator.share({
+            title: project.title,
+            text: `Mira este video creado con AutoVideo IA: "${project.title}"`,
+            files: [file],
+          });
+          return;
+        }
+      } catch (err: any) {
+        if (err?.name === 'AbortError') return;
+      }
+    }
+
     if (navigator.share) {
       try {
         await navigator.share({
@@ -251,6 +284,7 @@ export const PreviewExportView: React.FC<PreviewExportViewProps> = ({
       showToast('¡Enlace del proyecto copiado al portapapeles!', 'info');
     }
   };
+
 
   // 6. Generate YouTube SEO Metadata
   const handleGenerateYouTubeSEO = async () => {
@@ -564,12 +598,18 @@ export const PreviewExportView: React.FC<PreviewExportViewProps> = ({
           <div>
             <button
               onClick={handleExportVideo}
-              disabled={isExportingVideo}
-              className="w-full h-13 rounded-xl bg-gradient-to-r from-indigo-600 via-indigo-500 to-violet-600 hover:from-indigo-500 hover:to-violet-500 text-white font-bold text-sm flex items-center justify-center gap-2 shadow-lg shadow-indigo-600/25 active:scale-[0.98] transition"
+              disabled={!isAssetsLoaded || isExportingVideo}
+              className={`w-full h-13 rounded-xl font-bold text-sm flex items-center justify-center gap-2 shadow-lg transition ${
+                !isAssetsLoaded
+                  ? 'bg-slate-800 text-slate-400 cursor-not-allowed border border-slate-700'
+                  : 'bg-gradient-to-r from-indigo-600 via-indigo-500 to-violet-600 hover:from-indigo-500 hover:to-violet-500 text-white shadow-indigo-600/25 active:scale-[0.98]'
+              }`}
             >
               <Download className={`w-5 h-5 ${isExportingVideo ? 'animate-bounce' : ''}`} />
               <span>
-                {isExportingVideo
+                {!isAssetsLoaded
+                  ? 'Sincronizando recursos de video...'
+                  : isExportingVideo
                   ? `Renderizando video con voz y música (${exportProgress}%)...`
                   : 'Descargar Video Completo (MP4 / WebM)'}
               </span>

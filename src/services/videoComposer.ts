@@ -1,5 +1,5 @@
 import { AspectRatio, SceneItem, VideoProject } from '../types';
-import { createSynthesizedMusicBuffer } from './audioLibrary';
+import { getSynthesizedMusicBuffer } from './audioLibrary';
 
 export interface ComposerState {
   isPlaying: boolean;
@@ -120,6 +120,11 @@ export class VideoComposer {
 
     this.voiceGainNode.connect(this.voiceCompressor);
     this.voiceCompressor.connect(this.masterGainNode);
+
+    // Requisito 19: AnalyserNode (fftSize 2048) conectado como derivación de la salida del compresor de voz sin alterar la ruta
+    this.voiceAnalyserNode = this.audioCtx.createAnalyser();
+    this.voiceAnalyserNode.fftSize = 2048;
+    this.voiceCompressor.connect(this.voiceAnalyserNode);
 
     // 4. Background Music Bus
     this.musicGainNode = this.audioCtx.createGain();
@@ -313,7 +318,7 @@ export class VideoComposer {
       this.musicSourceNode.start(0, safeOffset);
     } else if (this.project.music.type !== 'custom') {
       const presetType = this.project.music.presetType || 'lofi';
-      const musicBuffer = createSynthesizedMusicBuffer(this.audioCtx, presetType, 30);
+      const musicBuffer = getSynthesizedMusicBuffer(this.audioCtx, presetType, 30);
       this.musicSourceNode = this.audioCtx.createBufferSource();
       this.musicSourceNode.buffer = musicBuffer;
       this.musicSourceNode.loop = true;
@@ -754,7 +759,7 @@ export class VideoComposer {
           musicBuffer = this.customMusicBuffer;
         } else {
           const presetType = this.project.music.presetType || 'lofi';
-          musicBuffer = createSynthesizedMusicBuffer(ctx, presetType, Math.ceil(this.totalDuration + 5));
+          musicBuffer = getSynthesizedMusicBuffer(ctx, presetType, 30);
         }
 
         const exportMusicSource = ctx.createBufferSource();
