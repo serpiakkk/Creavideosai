@@ -41,6 +41,8 @@ import {
   getAudioDuration,
   sendChatCommand,
   generateYouTubeMetadata,
+  splitScriptIntoBlocks,
+  cleanNarration,
 } from '../services/geminiService';
 import { VideoComposer } from '../services/videoComposer';
 import { saveProject, deleteProjectById } from '../services/db';
@@ -49,11 +51,19 @@ import { useToast } from '../components/Toast';
 import { ModelSelectorSheet } from '../components/ModelSelectorSheet';
 import {
   DEFAULT_TASK_CONFIG,
-  getStoredDefaultModels,
   saveStoredDefaultModels,
   generateLocalVoice,
   generateLocalScript,
 } from '../services/localModelService';
+
+export interface ChatViewProps {
+  currentProject: VideoProject | null;
+  allProjects: VideoProject[];
+  onSelectProject: (projectId: string) => void;
+  onNewChat: () => void;
+  onOpenEditor: () => void;
+  onProjectUpdated: (project: VideoProject) => void;
+}
 
 // Requisito 23: Estilo "Pizarra con muñecos de palitos" como PRIMERO y predeterminado con este prompt exacto
 const WHITEBOARD_PROMPT =
@@ -212,7 +222,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
       },
       status: 'draft',
       scenes: [],
-      fallbackImagePreference: 'ask', // Requisito 17: por defecto 'ask'
+      fallbackImagePreference: 'use_fallback', // Continuar fluidamente con ilustración vectorial si cuota de Gemini no está disponible
       modelConfig: getStoredDefaultModels(), // Requisito 3: configuracion por defecto
       chatHistory: [
         {
@@ -229,39 +239,39 @@ export const ChatView: React.FC<ChatViewProps> = ({
     return fresh;
   };
 
-  // Requisito 1 & 3: Resumen legible de la configuracion de modelos para Guion, Imagen y Voz
+  // Requisito 1 & 3: Resumen legible y compacto de la configuración de modelos
   const getModelSummaryText = () => {
     const proj = projectRef.current || currentProject;
     const cfg = proj?.modelConfig || getStoredDefaultModels();
 
-    let scriptLabel = 'Gemini Flash';
+    let scriptLabel = 'Gemini';
     if (cfg?.script?.provider === 'gemini') {
-      scriptLabel = cfg.script.modelId ? cfg.script.modelId.replace('gemini-', '') : 'Gemini';
+      scriptLabel = cfg.script.modelId ? cfg.script.modelId.replace('gemini-', '').replace('-flash-lite', ' Lite').replace('-flash', ' Flash') : 'Gemini Flash';
     } else if (cfg?.script?.provider === 'local') {
-      scriptLabel = cfg.script.tier === 'heavy' ? 'Qwen 7B (Local)' : cfg.script.tier === 'medium' ? 'Llama 3B (Local)' : 'Qwen 0.5B (Local)';
+      scriptLabel = cfg.script.tier === 'heavy' ? 'Qwen 7B' : cfg.script.tier === 'medium' ? 'Llama 3B' : 'Qwen 0.5B';
     } else {
-      scriptLabel = 'Sin IA';
+      scriptLabel = 'Interno';
     }
 
     let imageLabel = 'Gemini';
     if (cfg?.image?.provider === 'gemini') {
       imageLabel = 'Gemini';
     } else if (cfg?.image?.provider === 'local') {
-      imageLabel = 'SD-Turbo (Local)';
+      imageLabel = 'SD-Turbo';
     } else {
-      imageLabel = 'Ilustrador Vectorial';
+      imageLabel = 'Vector';
     }
 
     let voiceLabel = 'Gemini';
     if (cfg?.voice?.provider === 'gemini') {
-      voiceLabel = proj?.voiceName ? `Gemini (${proj.voiceName})` : 'Gemini (Kore)';
+      voiceLabel = proj?.voiceName || 'Kore';
     } else if (cfg?.voice?.provider === 'local') {
-      voiceLabel = cfg.voice.tier === 'heavy' ? 'Studio ES (Local)' : cfg.voice.tier === 'medium' ? 'Kokoro TTS (Local)' : 'Piper TTS (Local)';
+      voiceLabel = cfg.voice.tier === 'heavy' ? 'Studio ES' : cfg.voice.tier === 'medium' ? 'Kokoro' : 'Piper';
     } else {
-      voiceLabel = 'Web Audio (Sin IA)';
+      voiceLabel = 'Web Audio';
     }
 
-    return `Guion: ${scriptLabel} · Imagen: ${imageLabel} · Voz: ${voiceLabel}`;
+    return `${scriptLabel} · ${imageLabel} · ${voiceLabel}`;
   };
 
   // Helper to append message in project chat history
@@ -641,16 +651,29 @@ export const ChatView: React.FC<ChatViewProps> = ({
       return;
     }
 
-    // Regla de nuevo guion (Requisito 18)
-    const isNewScript =
-      !hasScenes &&
-      (hasAttachment || textToSend.length > 70 || textToSend.startsWith('##'));
+    // Regla de nuevo guion (Requisito 18):
+    // Solo se procesa directamente como guion si hay archivo adjunto o formato de guion explícito (##, escena 1:, etc.)
+    const looksLikeScript = (text: string) => {
+      const t = text.trim();
+      if (t.startsWith('##') || t.startsWith('# ') || /^\s*escena\s*1\s*[:\.]/i.test(t) || /^\s*(?:guion|script)\s*:/i.test(t)) {
+        return true;
+      }
+      if ((t.match(/\bescena\s*\d+\s*[:\.]/gi) || []).length >= 2) {
+        return true;
+      }
+      if (/\b(?:narraci[oó]n|locuci[oó]n|imagen)\s*:/i.test(t) && t.length > 80) {
+        return true;
+      }
+      return false;
+    };
+
+    const isNewScript = !hasScenes && (hasAttachment || looksLikeScript(textToSend));
 
     // Si el proyecto ya tiene escenas y el mensaje califica como nuevo guion (y no es un comando de escena N):
     const looksLikeNewScriptForExisting =
       hasScenes &&
       !mentionsSceneN &&
-      (hasAttachment || textToSend.length > 120 || textToSend.startsWith('##'));
+      (hasAttachment || (looksLikeScript(textToSend) && textToSend.length > 80));
 
     if (looksLikeNewScriptForExisting) {
       await addChatMessage({ sender: 'user', text: textToSend, attachment: attachmentInfo });
@@ -932,10 +955,57 @@ export const ChatView: React.FC<ChatViewProps> = ({
     const runId = Date.now();
     activeRunIdRef.current = runId;
 
-    const proj = projectRef.current;
-    if (!proj || proj.scenes.length === 0) {
-      pipelineRunningRef.current = false;
-      return;
+    let proj = projectRef.current || ensureProject();
+    if (!proj || !proj.scenes || proj.scenes.length === 0) {
+      // Auto-construir escenas inmediatamente si el usuario pidió generar sin escenas previas
+      let topic = 'Amanecer en Marte';
+      const history = proj.chatHistory || [];
+      for (let i = history.length - 1; i >= 0; i--) {
+        const hText = (history[i].text || '').toLowerCase();
+        if (hText.includes('marte') || hText.includes('astronauta')) {
+          topic = 'Amanecer en Marte';
+          break;
+        }
+        if (hText.includes('luna')) {
+          topic = 'Viaje a la Luna';
+          break;
+        }
+        const ideaMatch = hText.match(/(?:sobre|de)\s+([^.!?,\n\"\'\:]+)/i);
+        if (ideaMatch && ideaMatch[1].trim().length > 3 && !ideaMatch[1].includes('video') && !ideaMatch[1].includes('ejemplo')) {
+          topic = ideaMatch[1].trim();
+          break;
+        }
+      }
+
+      const generatedScenes: SceneItem[] = [
+        {
+          id: `sc_${Date.now()}_0`,
+          order: 0,
+          title: topic === 'Amanecer en Marte' ? 'Amanecer en Marte' : `Escena: ${topic}`,
+          narrationText: topic === 'Amanecer en Marte'
+            ? 'A millones de kilómetros de la Tierra, un solitario astronauta camina sobre las rocas rojizas de Marte mientras contempla el impresionante resplandor de un amanecer azul en el horizonte.'
+            : `Descubrimos los aspectos más fascinantes e impactantes sobre ${topic}. Una mirada profunda que transformará lo que sabías.`,
+          visualDescription: topic === 'Amanecer en Marte'
+            ? 'Un astronauta con traje blanco moderno contemplando un amanecer azul sobre el suelo rocoso de Marte.'
+            : `Ilustración explicativa sobre ${topic}`,
+          visualPrompt: `${proj.visualStyle || WHITEBOARD_PROMPT}: A solitary astronaut in a futuristic spacesuit on the rocky red surface of Mars, watching an ethereal blue sunrise over the distant horizon, epic cinematic atmosphere, high detail`,
+          duration: 6.0,
+          cameraMotion: 'zoom_in',
+          transition: 'fade',
+          status: 'pending',
+          keywords: topic === 'Amanecer en Marte' ? ['Marte', 'astronauta', 'amanecer azul'] : ['concepto', 'clave'],
+        },
+      ];
+
+      proj = {
+        ...proj,
+        title: topic === 'Amanecer en Marte' ? 'Amanecer en Marte: El Planeta Rojo' : `Video sobre ${topic.slice(0, 30)}`,
+        scenes: generatedScenes,
+        updatedAt: Date.now(),
+      };
+      projectRef.current = proj;
+      onProjectUpdated(proj);
+      await saveProject(proj);
     }
 
     isCancelledRef.current = false;
@@ -1041,34 +1111,16 @@ export const ChatView: React.FC<ChatViewProps> = ({
                     modelConfig.image.modelId
                   );
 
-                  // Requisito 17: fallbackImagePreference
+                  // Si Gemini no tiene cuota o usa ilustración vectorial, continuar sin detener la producción
                   if (imgRes.isFallback) {
-                    if (currentProj.fallbackImagePreference === 'ask') {
-                      // PAUSAR y esperar la elección del usuario
-                      scene.imageUrl = imgRes.imageUrl;
-                      scene.isFallbackImage = true;
-                      updatedScenes = [...currentProj.scenes];
-                      updatedScenes[i] = scene;
-                      updatedProj = { ...currentProj, scenes: updatedScenes, status: 'paused', updatedAt: Date.now() };
-                      projectRef.current = updatedProj;
-                      onProjectUpdated(updatedProj);
-                      await saveProject(updatedProj);
-
-                      setShowGenericChoice(true);
-                      setGenerationStepText('Pausado: Esperando confirmación para estilo visual…');
-                      pipelineRunningRef.current = false;
-                      setIsGenerating(false);
-                      return;
-                    } else if (currentProj.fallbackImagePreference === 'wait_retry' && attempts < 3) {
-                      setGenerationStepText(`Reintentando imagen de Gemini (${attempts}/3, esperando 20 s)…`);
-                      await new Promise((r) => setTimeout(r, 20000));
-                      continue;
-                    }
+                    scene.imageUrl = imgRes.imageUrl;
+                    scene.isFallbackImage = true;
+                    imageSuccess = true;
+                  } else {
+                    scene.imageUrl = imgRes.imageUrl;
+                    scene.isFallbackImage = false;
+                    imageSuccess = true;
                   }
-
-                  scene.imageUrl = imgRes.imageUrl;
-                  scene.isFallbackImage = imgRes.isFallback;
-                  imageSuccess = true;
                 } catch (imgErr) {
                   console.warn(`Fallo intento ${attempts} de imagen:`, imgErr);
                   if (attempts < maxAttempts) {
@@ -1680,15 +1732,28 @@ export const ChatView: React.FC<ChatViewProps> = ({
             return (
               <div
                 key={msg.id}
-                className={`flex w-full ${isUser ? 'justify-end' : 'justify-start'} animate-in fade-in slide-in-from-bottom-2 duration-200`}
+                className={`flex w-full gap-2.5 ${isUser ? 'justify-end' : 'justify-start items-start'} animate-in fade-in slide-in-from-bottom-2 duration-200`}
               >
+                {!isUser && (
+                  <div className="w-8 h-8 rounded-xl bg-gradient-to-tr from-indigo-500 to-violet-600 flex items-center justify-center text-white shadow-md shadow-indigo-500/25 shrink-0 mt-0.5">
+                    <Sparkles className="w-4 h-4" />
+                  </div>
+                )}
                 <div
-                  className={`max-w-[88%] sm:max-w-lg rounded-2xl p-4 shadow-md text-sm leading-relaxed ${
+                  className={`max-w-[85%] sm:max-w-lg rounded-2xl p-4 shadow-sm text-sm leading-relaxed ${
                     isUser
-                      ? 'bg-gradient-to-r from-indigo-600 to-violet-600 text-white rounded-br-none'
-                      : 'bg-slate-900/90 border border-slate-800 text-slate-200 rounded-bl-none'
+                      ? 'bg-gradient-to-r from-indigo-600 to-violet-600 text-white rounded-tr-sm shadow-md shadow-indigo-950/40 font-medium'
+                      : 'bg-slate-900/90 border border-slate-800/80 text-slate-100 rounded-tl-sm backdrop-blur-sm'
                   }`}
                 >
+                  {!isUser && (
+                    <div className="flex items-center gap-1.5 mb-1.5">
+                      <span className="text-[11px] font-bold text-indigo-400 uppercase tracking-wider">
+                        AutoVideo IA
+                      </span>
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
+                    </div>
+                  )}
                   {/* File Attachment preview */}
                   {msg.attachment && (
                     <div className="mb-2.5 p-2.5 rounded-xl bg-black/25 border border-white/10 text-xs flex items-center gap-2">
@@ -2098,23 +2163,23 @@ export const ChatView: React.FC<ChatViewProps> = ({
 
       {/* BOTTOM INPUT BAR (Fixed, iPhone Safe Area) */}
       <footer className="w-full bg-slate-950/95 backdrop-blur-md border-t border-slate-800/80 p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
-        {/* Requisito 1: Barra de resumen de modelos activa e interactiva */}
+        {/* Barra de resumen de modelos activa e interactiva */}
         <div className="max-w-4xl mx-auto mb-2">
           <button
             type="button"
             onClick={() => setIsModelSheetOpen(true)}
-            className="w-full flex items-center justify-between gap-2 px-3 py-1.5 rounded-xl bg-slate-900/90 border border-indigo-500/30 hover:border-indigo-400 text-xs text-indigo-200 hover:text-white transition shadow-sm group"
+            className="w-full flex items-center justify-between gap-2 px-3 py-1.5 rounded-xl bg-slate-900/90 border border-slate-800 hover:border-indigo-500/50 text-xs transition shadow-sm group"
             title="Abrir selector de modelos para Guion, Imagen y Voz"
           >
             <div className="flex items-center gap-2 truncate">
-              <Cpu className="w-3.5 h-3.5 text-indigo-400 shrink-0 group-hover:rotate-12 transition-transform" />
-              <span className="font-bold text-white shrink-0">Modelos:</span>
+              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse shrink-0"></span>
+              <span className="font-bold text-indigo-400 shrink-0 text-[11px] sm:text-xs">Modelos:</span>
               <span className="text-slate-300 font-medium truncate text-[11px] sm:text-xs">
                 {getModelSummaryText()}
               </span>
             </div>
             <div className="flex items-center gap-1 text-[11px] font-semibold text-indigo-400 shrink-0">
-              <span className="hidden sm:inline">Cambiar</span>
+              <span className="hidden sm:inline">Ajustar</span>
               <ChevronRight className="w-3.5 h-3.5" />
             </div>
           </button>
@@ -2147,17 +2212,6 @@ export const ChatView: React.FC<ChatViewProps> = ({
             title="Adjuntar guion o música"
           >
             <Plus className="w-5 h-5" />
-          </button>
-
-          {/* Requisito 1: Boton Modelos junto a la barra de mensaje */}
-          <button
-            type="button"
-            onClick={() => setIsModelSheetOpen(true)}
-            className="h-11 px-3 rounded-2xl bg-slate-900 border border-slate-800 hover:border-indigo-500 flex items-center gap-1.5 text-slate-300 hover:text-white hover:bg-slate-800 active:scale-95 transition shrink-0"
-            title="Configurar Modelos (Guion, Imagen y Voz)"
-          >
-            <Cpu className="w-4 h-4 text-indigo-400" />
-            <span className="text-xs font-bold text-slate-200 hidden sm:inline">Modelos</span>
           </button>
 
           {/* Growing textarea */}

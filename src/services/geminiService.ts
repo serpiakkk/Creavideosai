@@ -118,7 +118,7 @@ export function splitScriptIntoBlocks(rawScript: string): ScriptBlock[] {
 }
 
 // Helper según Requisito 33: quita solo líneas "IMAGEN:", encabezados markdown y acotaciones actorales; no borra paréntesis con datos
-function cleanNarration(text: string): string {
+export function cleanNarration(text: string): string {
   return (text || '')
     .replace(/^(?:IMAGEN|IMÁGEN|VISUAL):.*$/gim, '')
     .replace(/#{1,6}\s.*$/gm, '')
@@ -169,7 +169,7 @@ export async function parseScriptWithGemini(
       attempts++;
       try {
         // Requisito 28: pasa characterDescription guardada y maxOutputTokens
-        const response = await fetch('/api/script/parse', {
+        const fetchRes: Response = await fetch('/api/script/parse', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -181,8 +181,8 @@ export async function parseScriptWithGemini(
           }),
         });
 
-        const data = await response.json();
-        if (!response.ok) {
+        const data: any = await fetchRes.json();
+        if (!fetchRes.ok) {
           throw new Error(data.error || `Error al procesar bloque ${chunkIdx + 1}`);
         }
 
@@ -293,7 +293,8 @@ export async function enhanceScriptWithGemini(
 export async function generateImageWithGemini(
   prompt: string,
   aspectRatio: AspectRatio,
-  sceneContext?: { title?: string; narrationText?: string; keywords?: string[] }
+  sceneContext?: { title?: string; narrationText?: string; keywords?: string[] },
+  modelId?: string
 ): Promise<GenerateImageResult> {
   const response = await fetch('/api/image/generate', {
     method: 'POST',
@@ -304,6 +305,7 @@ export async function generateImageWithGemini(
       title: sceneContext?.title,
       narrationText: sceneContext?.narrationText,
       keywords: sceneContext?.keywords,
+      modelId,
     }),
   });
 
@@ -326,12 +328,13 @@ export async function generateVoiceWithGemini(
   text: string,
   voiceName: string = 'Kore',
   speed: number = 1.1,
-  tone: string = 'informativo'
+  tone: string = 'informativo',
+  modelId?: string
 ): Promise<GenerateVoiceResult> {
   const response = await fetch('/api/voice/generate', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text, voiceName, speed, tone }),
+    body: JSON.stringify({ text, voiceName, speed, tone, modelId }),
   });
 
   const data = await response.json();
@@ -382,19 +385,35 @@ export async function generateYouTubeMetadata(
   return data.metadata;
 }
 
-// 5. Send Chat Natural Language Command
 export interface ChatCommandResult {
   success: boolean;
   understood: boolean;
-  actionType: 'change_voice' | 'change_aspect_ratio' | 'change_style' | 'change_music' | 'regenerate_image' | 'regenerate_voice' | 'unknown';
+  actionType:
+    | 'start_generation'
+    | 'create_script'
+    | 'conversation'
+    | 'edit_scene'
+    | 'change_voice'
+    | 'change_aspect_ratio'
+    | 'change_style'
+    | 'change_music'
+    | 'regenerate_image'
+    | 'regenerate_voice'
+    | 'ask_scene_correction'
+    | 'unknown';
   parameters?: {
     voiceName?: string;
     aspectRatio?: AspectRatio;
     visualStyle?: string;
     presetType?: string;
     sceneIndex?: number;
+    newNarrationText?: string;
     customPrompt?: string;
     question?: string;
+    testMode?: boolean;
+    title?: string;
+    autoStart?: boolean;
+    scenes?: any[];
   };
   replyMessage: string;
 }

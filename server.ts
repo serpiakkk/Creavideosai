@@ -565,7 +565,12 @@ app.post('/api/image/generate', async (req, res) => {
       }
     }
   } catch (error: any) {
-    console.warn('Modelo ráster no disponible o cuota limitada. Activando ilustrador vectorial...', error?.message);
+    const isQuota = error?.status === 429 || (error?.message || '').includes('quota') || (error?.message || '').includes('RESOURCE_EXHAUSTED');
+    if (isQuota) {
+      console.log('Generación de imagen en la nube sin cuota gratuita (límite 0). Usando ilustrador vectorial adaptativo instantáneo.');
+    } else {
+      console.warn('Modelo de imagen no disponible. Activando ilustrador vectorial...', error?.message);
+    }
   }
 
   // 2. Fallback Inteligente: Generador de Ilustración de Escena Vectorial de Alta Definición
@@ -649,7 +654,7 @@ app.post('/api/voice/generate', async (req, res) => {
         const rawBuffer = Buffer.from(base64Audio, 'base64');
 
         // Requisito 34: Servidor de voz: si es audio crudo (audio/L16 o pcm) agrégale la cabecera WAV (24000 Hz, 16 bits, mono)
-        let finalBuffer = rawBuffer;
+        let finalBuffer: any = rawBuffer;
         const isRawPcm =
           mimeType.includes('l16') ||
           mimeType.includes('pcm') ||
@@ -754,29 +759,117 @@ app.post('/api/chat/command', async (req, res) => {
 
     const msgLower = userMessage.toLowerCase().trim();
 
-    // Requisito 29: Revisa PRIMERO las reglas de "regenerar imagen/voz de la escena N"
-    // C. Regenerar imagen: "rehaz la imagen de la escena 3 con un cerebro gigante"
-    const regenImgMatch = msgLower.match(/\b(?:rehaz|regenera|cambia|actualiza)\s+(?:la\s+)?imagen\s+(?:de\s+la\s+)?escena\s+(\d+)(?:\s+con\s+(.+))?/i);
-    // 0. GENERAR VIDEO / INICIAR PRODUCCIÓN DE ESCENAS
-    // Resuelve directamente: "ella habla y nunca me hace los videos"
-    // Ejemplos: "haz el video", "genera el video", "haz el video ya", "empieza a generar", "inicia la generación", "créalo ya", "dibuja las escenas", "hazlo ya", "empieza", "inicia", "producir video"
-    const isStartGenIntent =
-      /\b(?:haz(?:me)?|genera|crea|inicia|empieza|arranca|renderiza|produc(?:e|ir))\s+(?:el\s+|la\s+)?(?:video|generaci[oó]n|escenas|producci[oó]n|dibujo|dibujos)\b/i.test(msgLower) ||
-      /\b(?:hazlo\s+ya|empieza\s+ya|inicia\s+ya|gen[eé]ralo\s+ya|hazlo|empieza|inicia)\b/i.test(msgLower);
+    // 0. PEDIR EJEMPLO O ESCENA DE MUESTRA
+    // Resuelve directamente: "Dame una escena de cualquier cosa de ejemplo para ver"
+    const isExampleRequest =
+      /\b(?:dame|pon|muestra|haz(?:me)?|crea|inventa|escribe|quiero)\s+(?:una?\s+)?(?:escena|ejemplo|muestra)\b/i.test(msgLower) ||
+      /\b(?:ejemplo\s+de\s+(?:video|escena)|escena\s+de\s+ejemplo|video\s+de\s+ejemplo|un\s+ejemplo\s+para\s+ver)\b/i.test(msgLower) ||
+      /\b(?:dame\s+una\s+escena|mu[eé]strame\s+una\s+escena)\b/i.test(msgLower);
 
-    if (isStartGenIntent && !msgLower.includes('sobre') && !msgLower.includes('de un') && !msgLower.includes('guion')) {
-      const isTest = msgLower.includes('prueba') || msgLower.includes('2 escenas');
+    if (isExampleRequest) {
+      let topic = '';
+      const topicMatch = msgLower.match(/(?:sobre|de)\s+([^.!?,\n]+)/i);
+      if (topicMatch && topicMatch[1].trim().length > 2 && !topicMatch[1].includes('ejemplo') && !topicMatch[1].includes('cualquier')) {
+        topic = topicMatch[1].trim();
+      }
+      const title = topic ? `Video sobre ${topic.slice(0, 30)}` : 'Amanecer en Marte: El Planeta Rojo';
+      const narration = topic
+        ? `Descubrimos los aspectos más fascinantes e impactantes sobre ${topic}. Una mirada profunda que transformará lo que sabías.`
+        : 'A millones de kilómetros de la Tierra, un solitario astronauta camina sobre las rocas rojizas de Marte mientras contempla el impresionante amanecer azul en el horizonte.';
+      const visualDesc = topic
+        ? `Ilustración conceptual de alta definición explicando los puntos clave de ${topic}`
+        : 'Un astronauta con traje espacial blanco moderno contemplando un amanecer azul sobre el suelo rocoso de Marte.';
+      const visualPrompt = `${currentProject?.visualStyle || 'Cinematic whiteboard concept art'}: A solitary astronaut in a futuristic spacesuit on the rocky red surface of Mars, watching an ethereal blue sunrise over the distant horizon, epic cinematic atmosphere, high detail`;
+
+      const exampleScene = {
+        title: topic ? `Escena 1: ${topic}` : 'Amanecer en Marte',
+        narrationText: narration,
+        visualDescription: visualDesc,
+        visualPrompt,
+        estimatedDuration: 6.0,
+        cameraMotion: 'zoom_in',
+        keywords: topic ? [topic.split(' ')[0] || 'concepto', 'clave'] : ['Marte', 'astronauta', 'amanecer azul'],
+      };
+
       return res.json({
         success: true,
         understood: true,
-        actionType: 'start_generation',
-        parameters: { testMode: isTest },
-        replyMessage: isTest
-          ? '¡Iniciando la prueba rápida con las 2 primeras escenas ahora mismo!'
-          : '¡Iniciando la generación de tu video completo ahora mismo!',
+        actionType: 'create_script',
+        parameters: {
+          title,
+          scenes: [exampleScene],
+          autoStart: false,
+        },
+        replyMessage: `¡He creado la escena de ejemplo "${title}"! Ya está cargada en tu proyecto. Puedes pulsar "Generar video completo" o decirme "haz el video" para comenzar la producción de imagen y voz de inmediato.`,
       });
     }
 
+    // 0.1 GENERAR VIDEO / INICIAR PRODUCCIÓN DE ESCENAS
+    // Resuelve directamente: "ella habla y nunca me hace los videos" y "no lo veo que lo estes generando"
+    const isStartGenIntent =
+      /\b(?:haz(?:me)?|genera|crea|inicia|empieza|arranca|renderiza|produc(?:e|ir))\s+(?:el\s+|la\s+)?(?:video|generaci[oó]n|escenas|producci[oó]n|dibujo|dibujos)\b/i.test(msgLower) ||
+      /\b(?:hazlo\s+ya|empieza\s+ya|inicia\s+ya|gen[eé]ralo\s+ya|hazlo|empieza|inicia)\b/i.test(msgLower) ||
+      /\b(?:no\s+(?:lo\s+)?veo\s+(?:que\s+lo\s+est[eé]s?\s+generando|que\s+empiece)|por\s+qu[eé]\s+no\s+(?:se\s+genera|empieza))\b/i.test(msgLower);
+
+    if (isStartGenIntent && !msgLower.includes('sobre') && !msgLower.includes('de un') && !msgLower.includes('guion')) {
+      const isTest = msgLower.includes('prueba') || msgLower.includes('2 escenas');
+      const sceneCount = currentProject?.scenesCount || currentProject?.scenes?.length || 0;
+
+      // Si el proyecto ya tiene escenas, lanza la generación directamente
+      if (sceneCount > 0) {
+        return res.json({
+          success: true,
+          understood: true,
+          actionType: 'start_generation',
+          parameters: { testMode: isTest },
+          replyMessage: isTest
+            ? '¡Iniciando la prueba rápida con las 2 primeras escenas ahora mismo!'
+            : '¡Iniciando la generación de tu video completo ahora mismo!',
+        });
+      }
+
+      // Si no tiene escenas aún pero el usuario dice "genera el video":
+      // Buscar en el historial de chat si se habló de algún tema o escena (ej: astronauta en Marte)
+      let detectedTopic = '';
+      const history = currentProject?.chatHistory || [];
+      for (let i = history.length - 1; i >= 0; i--) {
+        const hText = (history[i].text || '').toLowerCase();
+        if (hText.includes('marte') || hText.includes('astronauta')) {
+          detectedTopic = 'Amanecer en Marte';
+          break;
+        }
+        if (hText.includes('luna')) {
+          detectedTopic = 'Viaje a la Luna';
+          break;
+        }
+        const ideaMatch = hText.match(/(?:sobre|de)\s+([^.!?,\n\"\'\:]+)/i);
+        if (ideaMatch && ideaMatch[1].trim().length > 3 && !ideaMatch[1].includes('video') && !ideaMatch[1].includes('ejemplo')) {
+          detectedTopic = ideaMatch[1].trim();
+          break;
+        }
+      }
+      if (!detectedTopic) detectedTopic = 'Amanecer en Marte';
+
+      const localGen = parseScriptLocally(
+        `# ${detectedTopic}\n\n## Escena 1: El Despertar\nUn astronauta camina sobre la superficie rojiza de Marte contemplando un asombroso amanecer azul en el horizonte.\n\n## Escena 2: La Frontera Estelar\nLa humanidad avanza hacia nuevos límites explorando los misterios del cosmos.`,
+        currentProject?.visualStyle || 'Simple 2D whiteboard animation style illustration'
+      );
+
+      return res.json({
+        success: true,
+        understood: true,
+        actionType: 'create_script',
+        parameters: {
+          title: localGen.title || detectedTopic,
+          scenes: localGen.scenes,
+          autoStart: true, // ChatView iniciará runGenerationPipeline de inmediato!
+        },
+        replyMessage: `¡Estructuré las escenas para "${detectedTopic}" a partir de nuestra conversación e inicio la producción de imagen y voz de inmediato!`,
+      });
+    }
+
+    // C. Regenerar imagen: "rehaz la imagen de la escena 3 con un cerebro gigante"
+    const regenImgMatch = msgLower.match(/\b(?:rehaz|regenera|cambia|actualiza)\s+(?:la\s+)?imagen\s+(?:de\s+la\s+)?escena\s+(\d+)(?:\s+con\s+(.+))?/i);
     if (regenImgMatch) {
       const sceneNum = parseInt(regenImgMatch[1], 10);
       const customPrompt = regenImgMatch[2]?.trim();
@@ -988,12 +1081,15 @@ app.post('/api/chat/command', async (req, res) => {
       .map((s: any) => `• Escena ${s.order + 1} (${s.title}): "${s.narration}"`)
       .join('\n');
 
-    // Llamar a Gemini con timeout estricto de 6 segundos y memoria completa
+    // Llamar a Gemini 3.8 Flash con timeout estricto y razonamiento superior
     const ai = getGeminiClient();
-    const systemPrompt = `Eres el asistente ejecutivo de AutoVideo IA.
-Eres inteligente, lógico, directo y con excelente memoria contextual. NUNCA sobrepienses ni des rodeos ni pidas confirmaciones obvias.
-Si el usuario te pide crear o hacer el video, ejecuta la acción "start_generation" inmediatamente.
-Si el usuario te pide cambiar un texto o detalle de una escena, aplica la acción "edit_scene".
+    const systemPrompt = `Eres el asistente ejecutivo y director de producción de AutoVideo IA.
+Eres sumamente inteligente, lógico, directo y con memoria contextual impecable. NUNCA sobrepienses ni des rodeos ni pidas confirmaciones obvias.
+REGLAS CRÍTICAS:
+1. Si el usuario te pide una escena de ejemplo, una muestra, o describe una idea ("dame una escena...", "hazme un ejemplo", "un video sobre..."), NUNCA devuelvas solo texto conversacional. Genera de inmediato "create_script" con escenas reales estructuradas en parameters.scenes.
+2. Si el usuario dice "genera el video", "haz el video", "empieza", "inicia", "créalo ya", ejecuta "start_generation" de inmediato. Si no hay escenas previas, usa "create_script" con autoStart: true basándote en la conversación anterior.
+3. Si el usuario pide cambiar un texto o detalle de una escena, aplica la acción "edit_scene".
+4. Responde con calidez y seguridad, en español conciso.
 
 Historial de conversación reciente (MEMORIA CONTEXTUAL):
 ${historyText || '(Inicio de conversación)'}
@@ -1003,11 +1099,12 @@ ${scenesSummaryText || '(Sin escenas aún)'}
 
 Acciones válidas (actionType):
 - "start_generation": El usuario te pide hacer, generar, iniciar o crear el video. (testMode: boolean opcional).
-- "conversation": El usuario charla, hace preguntas sobre el video o pide aclaraciones. Responde de forma inteligente, concisa y empática en replyMessage.
-- "edit_scene": El usuario pide cambiar, corregir o arreglar el texto de una escena. sceneIndex (número de escena 0-based), newNarrationText (texto corregido).
+- "create_script": El usuario pide un ejemplo, una escena, o propone una idea para su video. Parámetros: title (string), scenes (array de objetos con title, narrationText, visualDescription, visualPrompt, estimatedDuration, cameraMotion, keywords), autoStart (boolean).
+- "conversation": El usuario charla, hace preguntas o comentarios. Responde de forma inteligente, concisa y empática en replyMessage.
+- "edit_scene": El usuario pide cambiar, corregir o arreglar el texto de una escena. sceneIndex (0-based), newNarrationText.
 - "change_voice": voiceName ('Kore' | 'Puck' | 'Charon' | 'Fenrir' | 'Zephyr').
 - "change_aspect_ratio": aspectRatio ('16:9' | '9:16').
-- "change_style": visualStyle (estilo en inglés o descriptivo).
+- "change_style": visualStyle (estilo visual).
 - "change_music": presetType ('lofi' | 'upbeat' | 'cinematic' | 'corporate' | 'none').
 - "regenerate_image": sceneIndex, customPrompt.
 - "regenerate_voice": sceneIndex.
@@ -1024,7 +1121,7 @@ Estado actual del proyecto:
     try {
       response = await callGeminiWithTimeout(
         ai.models.generateContent({
-          model: 'gemini-3.1-flash-lite',
+          model: 'gemini-3.8-flash',
           contents: `Mensaje del usuario: "${userMessage}"`,
           config: {
             systemInstruction: systemPrompt,
@@ -1036,7 +1133,19 @@ Estado actual del proyecto:
                 understood: { type: Type.BOOLEAN },
                 actionType: {
                   type: Type.STRING,
-                  enum: ['start_generation', 'conversation', 'edit_scene', 'change_voice', 'change_aspect_ratio', 'change_style', 'change_music', 'regenerate_image', 'regenerate_voice', 'unknown']
+                  enum: [
+                    'start_generation',
+                    'create_script',
+                    'conversation',
+                    'edit_scene',
+                    'change_voice',
+                    'change_aspect_ratio',
+                    'change_style',
+                    'change_music',
+                    'regenerate_image',
+                    'regenerate_voice',
+                    'unknown'
+                  ]
                 },
                 parameters: {
                   type: Type.OBJECT,
@@ -1050,6 +1159,27 @@ Estado actual del proyecto:
                     newNarrationText: { type: Type.STRING },
                     customPrompt: { type: Type.STRING },
                     question: { type: Type.STRING },
+                    title: { type: Type.STRING },
+                    autoStart: { type: Type.BOOLEAN },
+                    scenes: {
+                      type: Type.ARRAY,
+                      items: {
+                        type: Type.OBJECT,
+                        properties: {
+                          title: { type: Type.STRING },
+                          narrationText: { type: Type.STRING },
+                          visualDescription: { type: Type.STRING },
+                          visualPrompt: { type: Type.STRING },
+                          estimatedDuration: { type: Type.NUMBER },
+                          cameraMotion: { type: Type.STRING },
+                          keywords: {
+                            type: Type.ARRAY,
+                            items: { type: Type.STRING }
+                          }
+                        },
+                        required: ['title', 'narrationText', 'visualDescription', 'visualPrompt']
+                      }
+                    }
                   }
                 },
                 replyMessage: { type: Type.STRING }
@@ -1058,10 +1188,10 @@ Estado actual del proyecto:
             }
           }
         }),
-        6000
+        7000
       );
     } catch (primaryErr) {
-      // Fallback conversacional local inteligente con memoria si Gemini no responde en 6s o la cuota se agota
+      // Fallback conversacional local inteligente con memoria si Gemini no responde a tiempo
       console.warn('Gemini chat command no disponible o timeout. Usando analizador inteligente local con memoria.');
       const sceneCount = currentProject?.scenesCount || currentProject?.scenes?.length || 0;
       let localReply = '';

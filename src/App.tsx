@@ -154,7 +154,7 @@ export default function App() {
           <ChatView
             currentProject={activeProject}
             allProjects={projects}
-            onSelectProject={(projectId) => {
+            onSelectProject={(projectId: string) => {
               setActiveProjectId(projectId);
             }}
             onNewChat={() => {

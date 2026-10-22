@@ -91,7 +91,17 @@ export interface ChatMessage {
     type: 'script' | 'music' | 'image';
     snippet?: string;
   };
-  widgetType?: 'script_parsed' | 'generating_progress' | 'video_ready' | 'quota_alert' | 'fallback_image_prompt' | 'models_sheet' | 'test_ready';
+  widgetType?:
+    | 'script_parsed'
+    | 'generating_progress'
+    | 'video_ready'
+    | 'quota_alert'
+    | 'fallback_image_prompt'
+    | 'models_sheet'
+    | 'test_ready'
+    | 'style_change_confirm'
+    | 'confirm_replace_script'
+    | 'failed_scenes_alert';
   widgetData?: any;
 }
 

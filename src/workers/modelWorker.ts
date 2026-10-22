@@ -167,7 +167,7 @@ self.onmessage = async (e: MessageEvent) => {
       const wavBuffer = synthesizePhoneticSpeech(text, voiceKind);
       const latencyMs = Math.round(performance.now() - t0);
 
-      self.postMessage(
+      (self as any).postMessage(
         {
           id,
           status: 'success',
